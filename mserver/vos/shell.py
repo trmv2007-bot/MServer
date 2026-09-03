@@ -12,6 +12,8 @@ import time
 from datetime import datetime
 
 from . import packages as pkgmod
+from . import snapshots as snapmod
+from . import userpkg
 from .kernel import (
     OS_NAME,
     OS_VERSION,
@@ -35,14 +37,30 @@ NO_GLOB = {
 }
 
 
-def tokenize(line: str) -> list[str]:
-    """Minimal shell tokenizer: spaces, quotes, \\, pipes, >, >> and ;."""
+def tokenize(line: str, expand=None) -> list[str]:
+    """Minimal shell tokenizer: spaces, quotes, \\, pipes, >, >>, ;, && and ||.
+
+    ``expand`` is an optional ``fn(text) -> text`` applied to unquoted and
+    double-quoted fragments. Single-quoted fragments are passed through
+    verbatim, which is what makes ``echo '$HOME'`` print the literal text.
+    """
+    def ex(text: str) -> str:
+        return expand(text) if expand else text
+
     tokens: list[str] = []
     i, n = 0, len(line)
     while i < n:
         c = line[i]
         if c in " \t":
             i += 1
+            continue
+        if line.startswith("&&", i):
+            tokens.append("&&")
+            i += 2
+            continue
+        if line.startswith("||", i):
+            tokens.append("||")
+            i += 2
             continue
         if line.startswith(">>", i):
             tokens.append(">>")
@@ -63,25 +81,53 @@ def tokenize(line: str) -> list[str]:
         if c in "\"'":
             quote, i, buf = c, i + 1, []
             while i < n and line[i] != quote:
-                if quote == '"' and line[i] == "\\" and i + 1 < n and line[i + 1] in "\"\\":
+                if quote == '"' and line[i] == "\\" and i + 1 < n and line[i + 1] in "\"\\$":
                     buf.append(line[i + 1])
                     i += 2
                     continue
                 buf.append(line[i])
                 i += 1
             i += 1
-            tokens.append("".join(buf))
+            text = "".join(buf)
+            # Single quotes are literal; double quotes still expand.
+            tokens.append(ex(text) if quote == '"' else text)
             continue
         if c == "\\" and i + 1 < n:
             tokens.append(line[i + 1])
             i += 2
             continue
         buf = []
-        while i < n and line[i] not in " \t|>\"'\\;":
+        while i < n and line[i] not in " \t|>\"'\\;&":
             buf.append(line[i])
             i += 1
-        tokens.append("".join(buf))
+        tokens.append(ex("".join(buf)))
     return tokens
+
+
+# Positional parameters ($1..$9, $@, $#) let agent-authored package
+# commands take arguments; they are set by userpkg._make_runner.
+_VAR_RE = re.compile(r"\$(\{)?([A-Za-z_][A-Za-z0-9_]*|[0-9]|\?|\$|@|#)(?(1)\})")
+
+# Extra usage detail for `man`, beyond the one-line help string.
+MAN_EXTRA = {
+    "ls": "ls [-l] [-a] [path]\n-l  long listing\n-a  include dotfiles",
+    "grep": "grep [-n] pattern [file]\n-n  show line numbers\nReads stdin when no file is given.",
+    "snapshot": ("snapshot list\nsnapshot save <name> [label]\n"
+                 "snapshot rollback <name>\nsnapshot rm <name>\n\n"
+                 "Snapshots are stored outside the vOS, so 'rm -rf /' cannot\n"
+                 "destroy them. A rollback saves the current state first."),
+    "pkg": "pkg list\npkg search <term>\npkg info <name>\npkg install <name>\npkg remove <name>",
+    "service": "service\nservice <name> start|stop|status",
+    "export": "export NAME=value\nexport            (list the environment)",
+    "alias": "alias                 list aliases\nalias ll='ls -la'     define one",
+    "echo": "echo [-n] text\n$VAR and ${VAR} are expanded; single quotes are literal.",
+    "find": "find [path] [-name glob]",
+    "history": "history\nPersisted to /root/.msh_history across restarts.",
+}
+
+HISTORY_PATH = "/root/.msh_history"
+MSHRC_PATH = "/root/.mshrc"
+MAX_HISTORY = 500
 
 
 class Shell:
@@ -93,8 +139,17 @@ class Shell:
         self._plugin_cmds: dict[str, object] = {}
         self._plugin_owner: dict[str, str] = {}
         self._help: dict[str, str] = {}
+        self.snapshots = snapmod.SnapshotStore(vos)
+        self.aliases: dict[str, str] = {}
+        self.last_status = 0
+        self.env: dict[str, str] = {
+            "HOME": "/root", "USER": "root", "LOGNAME": "root",
+            "OS": f"{OS_NAME} {OS_VERSION}", "SHELL": f"/bin/{SHELL_NAME}",
+            "TERM": "termux", "LANG": "en_US.UTF-8", "MSERVER": "1",
+            "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+        }
 
-        registry = pkgmod.build_registry()
+        registry = pkgmod.full_registry(vos)
         for name in vos.installed_packages():
             pkg = registry.get(name)
             if pkg:
@@ -115,6 +170,16 @@ class Shell:
             "neofetch": S.cmd_neofetch, "history": S.cmd_history,
             "which": S.cmd_which, "free": S.cmd_free, "df": S.cmd_df,
             "pkg": S.cmd_pkg, "service": S.cmd_service,
+            "snapshot": S.cmd_snapshot,
+            "export": S.cmd_export, "unset": S.cmd_unset,
+            "alias": S.cmd_alias, "unalias": S.cmd_unalias,
+            "source": S.cmd_source, "man": S.cmd_man,
+            "dmesg": S.cmd_dmesg, "logger": S.cmd_logger,
+            "sort": S.cmd_sort, "uniq": S.cmd_uniq, "cut": S.cmd_cut,
+            "tr": S.cmd_tr, "rev": S.cmd_rev, "tee": S.cmd_tee,
+            "seq": S.cmd_seq, "true": S.cmd_true, "false": S.cmd_false,
+            "yes": S.cmd_yes, "basename": S.cmd_basename,
+            "dirname": S.cmd_dirname, "stat": S.cmd_stat, "du": S.cmd_du,
         }
         self._help.update({
             "help": "show help (help <cmd> for details)",
@@ -150,12 +215,41 @@ class Shell:
             "df": "disk usage",
             "pkg": "package manager (pkg list|search|info|install|remove)",
             "service": "services (service [name] start|stop|status)",
+            "snapshot": "snapshots (snapshot [save|rollback|rm|list] [name])",
+            "export": "set an environment variable (export NAME=value)",
+            "unset": "remove an environment variable (unset NAME)",
+            "alias": "define or list aliases (alias ll='ls -la')",
+            "unalias": "remove an alias (unalias ll)",
+            "source": "run commands from a file (source /root/.mshrc)",
+            "man": "manual page for a command (man ls)",
+            "sort": "sort lines (sort [-r] [-n] [-u] [file])",
+            "uniq": "collapse repeated adjacent lines (uniq [-c])",
+            "cut": "select fields (cut -d: -f1 [file])",
+            "tr": "translate or delete characters (tr a-z A-Z | tr -d x)",
+            "rev": "reverse each line",
+            "tee": "write stdin to a file and pass it on (tee [-a] file)",
+            "seq": "print a number sequence (seq [first [incr]] last)",
+            "true": "do nothing, successfully",
+            "false": "do nothing, unsuccessfully",
+            "yes": "repeat a string",
+            "basename": "strip directory from a path",
+            "dirname": "strip the last component from a path",
+            "stat": "file details (size, type, mtime)",
+            "du": "disk usage of a path (du [-h] [path])",
+            "dmesg": "kernel ring buffer messages",
+            "logger": "write a message to /var/log/syslog",
         })
+        self._load_history()
+        self._run_rc()
 
     # --------------------------------------------------------- registration
     @property
     def commands(self) -> dict:
         return {**self._handlers, **self._plugin_cmds}
+
+    def command_names(self) -> set:
+        """Every name that currently resolves as a command."""
+        return set(self._handlers) | set(self._plugin_cmds) | set(self.aliases)
 
     def register_command(self, name, fn, help_text, owner) -> None:
         self._plugin_cmds[name] = fn
@@ -168,32 +262,119 @@ class Shell:
             self._plugin_owner.pop(name, None)
             self._help.pop(name, None)
 
+    # ------------------------------------------------------------ environment
+    def expand(self, text: str) -> str:
+        """Substitute $VAR, ${VAR}, $? and $$ in a fragment.
+
+        An undefined variable expands to the empty string, as a real shell
+        does. ``$?`` is the previous command's exit status.
+        """
+        if "$" not in text:
+            return text
+
+        def sub(m):
+            name = m.group(2)
+            if name == "?":
+                return str(self.last_status)
+            if name == "$":
+                return "1"  # msh runs as a single "process"
+            if name == "PWD":
+                return self.cwd
+            return self.env.get(name, "")
+
+        return _VAR_RE.sub(sub, text)
+
+    def _resolve_alias(self, line: str, depth: int = 0) -> str:
+        """Expand a leading alias, guarding against alias loops."""
+        if depth > 10:
+            return line
+        stripped = line.lstrip()
+        if not stripped:
+            return line
+        head, _, rest = stripped.partition(" ")
+        target = self.aliases.get(head)
+        if target is None:
+            return line
+        expanded = f"{target} {rest}".strip() if rest else target
+        # An alias whose body starts with its own name (ll='ls -la') must not
+        # recurse forever.
+        if expanded.split(" ")[0] == head:
+            return expanded
+        return self._resolve_alias(expanded, depth + 1)
+
+    def _run_rc(self) -> None:
+        """Execute /root/.mshrc at startup.
+
+        The file is created at boot with `alias ll='ls -la'` in it; before
+        this it was written and never read.
+        """
+        try:
+            if not self.vos.exists(MSHRC_PATH):
+                return
+            body = self.vos.read(MSHRC_PATH)
+        except Exception:
+            return
+        for raw in body.splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                try:
+                    self.run(line, _record=False)
+                except Exception:
+                    pass
+
+    def _load_history(self) -> None:
+        try:
+            if self.vos.exists(HISTORY_PATH):
+                self.history = self.vos.read(HISTORY_PATH).splitlines()[-MAX_HISTORY:]
+        except Exception:
+            self.history = []
+
+    def save_history(self) -> None:
+        """Persist history so it survives a restart."""
+        try:
+            self.vos.write(HISTORY_PATH,
+                           "\n".join(self.history[-MAX_HISTORY:]) + "\n")
+        except Exception:
+            pass
+
     # -------------------------------------------------------------- running
-    def run(self, line: str, stdin: str | None = None) -> tuple[str, str, int]:
+    def run(self, line: str, stdin: str | None = None,
+            _record: bool = True) -> tuple[str, str, int]:
         line = line.strip()
         if not line:
             return "", "", 0
-        self.history.append(line)
-        if len(self.history) > 500:
-            self.history = self.history[-500:]
+        if _record:
+            self.history.append(line)
+            if len(self.history) > MAX_HISTORY:
+                self.history = self.history[-MAX_HISTORY:]
+        line = self._resolve_alias(line)
         out, err, code = "", "", 0
         try:
-            segs: list[tuple[bool, list[str]]] = [(True, [])]
-            for t in tokenize(line):
-                if t == "|":
-                    segs.append((True, []))
-                elif t == ";":
-                    segs.append((False, []))
+            # (joiner, tokens) — joiner says how this segment relates to the
+            # previous one: "|" pipe, ";" sequence, "&&" on success, "||" on
+            # failure.
+            segs: list[tuple[str, list[str]]] = [("", [])]
+            for t in tokenize(line, expand=self.expand):
+                if t in ("|", ";", "&&", "||"):
+                    segs.append((t, []))
                 else:
                     segs[-1][1].append(t)
             cur_stdin = stdin
-            for piped, toks in segs:
+            for idx, (joiner, toks) in enumerate(segs):
+                if joiner == "&&" and code != 0:
+                    break
+                if joiner == "||" and code == 0:
+                    break
                 out, err, code = self._segment(toks, cur_stdin)
-                cur_stdin = out if piped else None
+                self.last_status = code
+                # Feed stdout onward only when the NEXT segment is a pipe.
+                nxt = segs[idx + 1][0] if idx + 1 < len(segs) else ""
+                cur_stdin = out if nxt == "|" else None
         except (VOSPathError, VOSFsError) as e:
             out, err, code = "", str(e), 1
         except Exception as e:  # keep the vOS alive no matter what
             out, err, code = "", f"msh: internal error: {e}", 1
+        self.last_status = code
         head = (out or err or "").splitlines()[:2]
         self.recent.append((time.time(), line, " ".join(head)[:120]))
         if len(self.recent) > 200:
@@ -507,13 +688,312 @@ class Shell:
     def cmd_clear(self, args, stdin):
         return "", "", 0
 
+    def cmd_dmesg(self, args, stdin):
+        text = self.vos.syslog.dmesg(self.vos.boot_time)
+        return (text + "\n" if text else "(kernel ring buffer is empty)"), "", 0
+
+    def cmd_logger(self, args, stdin):
+        message = " ".join(args) if args else (stdin or "").strip()
+        if not message:
+            return "", "logger: nothing to log", 1
+        self.vos.syslog.write("user", message)
+        return "", "", 0
+
+    # ------------------------------------------------------------ coreutils
+    def _text_in(self, args, stdin) -> str:
+        """Read from the named files, or from stdin when none are given."""
+        files = [a for a in args if not a.startswith("-")]
+        if files:
+            return "".join(self.vos.read(f) for f in files)
+        return stdin or ""
+
+    def cmd_sort(self, args, stdin):
+        text = self._text_in(args, stdin)
+        lines = text.splitlines()
+        flags = {a for a in args if a.startswith("-")}
+        if "-n" in flags:
+            def key(s):
+                m = re.match(r"\s*(-?\d+)", s)
+                return (0, int(m.group(1))) if m else (1, 0)
+            lines.sort(key=key)
+        else:
+            lines.sort()
+        if "-r" in flags:
+            lines.reverse()
+        if "-u" in flags:
+            seen, out = set(), []
+            for ln in lines:
+                if ln not in seen:
+                    seen.add(ln)
+                    out.append(ln)
+            lines = out
+        return ("\n".join(lines) + "\n" if lines else ""), "", 0
+
+    def cmd_uniq(self, args, stdin):
+        text = self._text_in(args, stdin)
+        count = "-c" in args
+        out, prev, n = [], None, 0
+        for ln in text.splitlines():
+            if ln == prev:
+                n += 1
+                continue
+            if prev is not None:
+                out.append(f"{n:>7} {prev}" if count else prev)
+            prev, n = ln, 1
+        if prev is not None:
+            out.append(f"{n:>7} {prev}" if count else prev)
+        return ("\n".join(out) + "\n" if out else ""), "", 0
+
+    def cmd_cut(self, args, stdin):
+        delim, fields = "\t", None
+        rest = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "-d" and i + 1 < len(args):
+                delim = args[i + 1] or "\t"
+                i += 2
+            elif a.startswith("-d"):
+                delim = a[2:] or "\t"
+                i += 1
+            elif a == "-f" and i + 1 < len(args):
+                fields = args[i + 1]
+                i += 2
+            elif a.startswith("-f"):
+                fields = a[2:]
+                i += 1
+            else:
+                rest.append(a)
+                i += 1
+        if not fields:
+            return "", "cut: you must specify a list of fields (-f)", 1
+        try:
+            wanted = []
+            for part in fields.split(","):
+                if "-" in part.strip("-") and not part.startswith("-"):
+                    a, _, b = part.partition("-")
+                    wanted.extend(range(int(a), int(b) + 1))
+                else:
+                    wanted.append(int(part))
+        except ValueError:
+            return "", f"cut: invalid field list: {fields}", 1
+        text = self._text_in(rest, stdin)
+        out = []
+        for ln in text.splitlines():
+            cols = ln.split(delim)
+            out.append(delim.join(cols[i - 1] for i in wanted
+                                  if 0 < i <= len(cols)))
+        return ("\n".join(out) + "\n" if out else ""), "", 0
+
+    @staticmethod
+    def _tr_set(spec: str) -> str:
+        """Expand a tr character set: 'a-z0-9_' -> the literal characters."""
+        out, i = [], 0
+        while i < len(spec):
+            if i + 2 < len(spec) and spec[i + 1] == "-" and spec[i + 2] >= spec[i]:
+                out.extend(chr(c) for c in range(ord(spec[i]), ord(spec[i + 2]) + 1))
+                i += 3
+            else:
+                out.append(spec[i])
+                i += 1
+        return "".join(out)
+
+    def cmd_tr(self, args, stdin):
+        rest = [a for a in args if not a.startswith("-")]
+        if "-d" in args and rest:
+            drop = self._tr_set(rest[0])
+            return (stdin or "").translate({ord(c): None for c in drop}), "", 0
+        if len(rest) < 2:
+            return "", "tr: usage: tr SET1 SET2  (or tr -d SET)", 1
+        src = self._tr_set(rest[0])
+        dst = self._tr_set(rest[1])
+        if not dst:
+            return "", "tr: empty replacement set", 1
+        if len(dst) < len(src):          # pad, as tr does
+            dst = dst + dst[-1] * (len(src) - len(dst))
+        return (stdin or "").translate(str.maketrans(src, dst[:len(src)])), "", 0
+
+    def cmd_rev(self, args, stdin):
+        text = self._text_in(args, stdin)
+        return "\n".join(ln[::-1] for ln in text.splitlines()) + "\n", "", 0
+
+    def cmd_tee(self, args, stdin):
+        text = stdin or ""
+        for f in [a for a in args if not a.startswith("-")]:
+            if "-a" in args:
+                self.vos.append(f, text)
+            else:
+                self.vos.write(f, text, create_dirs=True)
+        return text, "", 0
+
+    def cmd_seq(self, args, stdin):
+        nums = [a for a in args if not a.startswith("-")]
+        try:
+            vals = [int(x) for x in nums]
+        except ValueError:
+            return "", "seq: arguments must be integers", 1
+        if len(vals) == 1:
+            rng = range(1, vals[0] + 1)
+        elif len(vals) == 2:
+            rng = range(vals[0], vals[1] + 1)
+        elif len(vals) == 3:
+            rng = range(vals[0], vals[2] + 1, vals[1])
+        else:
+            return "", "seq: usage: seq [first [incr]] last", 1
+        return "\n".join(str(i) for i in rng) + "\n", "", 0
+
+    def cmd_true(self, args, stdin):
+        return "", "", 0
+
+    def cmd_false(self, args, stdin):
+        return "", "", 1
+
+    def cmd_yes(self, args, stdin):
+        word = " ".join(args) if args else "y"
+        return "\n".join([word] * 10) + "\n", "", 0
+
+    def cmd_basename(self, args, stdin):
+        if not args:
+            return "", "basename: needs a path", 1
+        name = args[0].rstrip("/").rsplit("/", 1)[-1] or "/"
+        if len(args) > 1 and name.endswith(args[1]) and name != args[1]:
+            name = name[: -len(args[1])]
+        return name + "\n", "", 0
+
+    def cmd_dirname(self, args, stdin):
+        if not args:
+            return "", "dirname: needs a path", 1
+        p = args[0].rstrip("/")
+        head = p.rsplit("/", 1)[0] if "/" in p else "."
+        return (head or "/") + "\n", "", 0
+
+    def cmd_stat(self, args, stdin):
+        if not args:
+            return "", "stat: needs a path", 1
+        out = []
+        for a in args:
+            p = self.vos.vpath(a)
+            if not p.exists():
+                return "", f"stat: no such file: {a}", 1
+            st = p.stat()
+            kind = "directory" if p.is_dir() else "regular file"
+            out.append(
+                f"  File: {self.vos.vname(p)}\n"
+                f"  Size: {st.st_size:<10} Type: {kind}\n"
+                f"Modify: {datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M:%S}"
+            )
+        return "\n".join(out), "", 0
+
+    def cmd_du(self, args, stdin):
+        target = next((a for a in args if not a.startswith("-")), self.cwd)
+        p = self.vos.vpath(target)
+        if not p.exists():
+            return "", f"du: no such path: {target}", 1
+        total = 0
+        if p.is_dir():
+            for f in p.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+        else:
+            total = p.stat().st_size
+        if "-h" in args:
+            return f"{snapmod.fmt_size(total)}\t{target}\n", "", 0
+        return f"{max(1, total // 1024)}\t{target}\n", "", 0
+
     def cmd_env(self, args, stdin):
-        return "\n".join([
-            "HOME=/root", "USER=root", "LOGNAME=root",
-            f"OS={OS_NAME} {OS_VERSION}", f"SHELL=/bin/{SHELL_NAME}",
-            "TERM=termux", "LANG=en_US.UTF-8",
-            f"PWD={self.cwd}", "MSERVER=1",
-        ]), "", 0
+        items = dict(self.env)
+        items["PWD"] = self.cwd
+        return "\n".join(f"{k}={v}" for k, v in sorted(items.items())), "", 0
+
+    def cmd_export(self, args, stdin):
+        if not args:
+            return self.cmd_env(args, stdin)
+        for a in args:
+            if "=" not in a:
+                # `export NAME` with no value: keep whatever is set.
+                self.env.setdefault(a, "")
+                continue
+            name, _, value = a.partition("=")
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+                return "", f"export: invalid variable name: {name}", 1
+            self.env[name] = value
+        return "", "", 0
+
+    def cmd_unset(self, args, stdin):
+        for a in args:
+            self.env.pop(a, None)
+        return "", "", 0
+
+    def cmd_alias(self, args, stdin):
+        if not args:
+            if not self.aliases:
+                return "(no aliases)", "", 0
+            return "\n".join(f"alias {k}='{v}'"
+                             for k, v in sorted(self.aliases.items())), "", 0
+        joined = " ".join(args)
+        if "=" not in joined:
+            out = []
+            for a in args:
+                if a in self.aliases:
+                    out.append(f"alias {a}='{self.aliases[a]}'")
+                else:
+                    out.append(f"alias: {a}: not found")
+            return "\n".join(out), "", 0
+        name, _, value = joined.partition("=")
+        name = name.strip()
+        value = value.strip().strip("'\"")
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_.-]*$", name):
+            return "", f"alias: invalid name: {name}", 1
+        self.aliases[name] = value
+        return "", "", 0
+
+    def cmd_unalias(self, args, stdin):
+        for a in args:
+            self.aliases.pop(a, None)
+        return "", "", 0
+
+    def cmd_source(self, args, stdin):
+        if not args:
+            return "", "source: needs a file", 1
+        try:
+            body = self.vos.read(args[0])
+        except (VOSPathError, VOSFsError) as e:
+            return "", f"source: {e}", 1
+        outs = []
+        for raw in body.splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                o, e, _ = self.run(line, _record=False)
+                if o:
+                    outs.append(o)
+                if e:
+                    outs.append(e)
+        return "\n".join(outs), "", 0
+
+    def cmd_man(self, args, stdin):
+        """Manual pages, built from the help text the shell already carries."""
+        if not args:
+            return "", "man: what manual page do you want? (try: man ls)", 1
+        name = args[0]
+        if name not in self.commands:
+            return "", f"man: no manual entry for {name}", 1
+        desc = self._help.get(name, "(no description)")
+        owner = self._plugin_owner.get(name)
+        origin = f"provided by package '{owner}'" if owner else "msh builtin"
+        lines = [
+            f"{name.upper()}(1)                     MServerOS Manual                     {name.upper()}(1)",
+            "",
+            "NAME",
+            f"    {name} — {desc}",
+            "",
+            "DESCRIPTION",
+            f"    {origin}.",
+        ]
+        extra = MAN_EXTRA.get(name)
+        if extra:
+            lines += ["", "USAGE"] + [f"    {ln}" for ln in extra.splitlines()]
+        lines += ["", "SEE ALSO", "    help — list every available command", ""]
+        return "\n".join(lines), "", 0
 
     def cmd_neofetch(self, args, stdin):
         logo = [
@@ -581,9 +1061,11 @@ class Shell:
 
     def cmd_pkg(self, args, stdin):
         if not args:
-            return "usage: pkg list | pkg search <term> | pkg info <name> | pkg install <name> | pkg remove <name>", "", 1
+            return ("usage: pkg list | pkg search <term> | pkg info <name> | "
+                    "pkg install <name> | pkg remove <name> | pkg created | "
+                    "pkg source <name> | pkg delete <name>"), "", 1
         sub = args[0]
-        registry = pkgmod.build_registry()
+        registry = pkgmod.full_registry(self.vos)
         if sub == "list":
             installed = set(self.vos.installed_packages())
             lines = [f"  {'*':<3}NAME          VERSION   DESCRIPTION"]
@@ -625,6 +1107,7 @@ class Shell:
                     self.vos.write(fpath, content)
                 p.register(self)
                 self.vos.set_installed_packages(self.vos.installed_packages() + [name])
+                self.vos.syslog.write("vos-pkg", f"installed {name} {p.version}")
                 out.append(f"Installing {name} {p.version} ... OK ({len(p.files)} files)")
             return "\n".join(out), "", 0
         if sub == "remove":
@@ -647,9 +1130,107 @@ class Shell:
                     except (VOSPathError, VOSFsError):
                         pass
                 self.vos.set_installed_packages([n for n in installed if n != name])
+                self.vos.syslog.write("vos-pkg", f"removed {name}")
                 out.append(f"Removed {name}")
             return "\n".join(out), "", 0
+        if sub in ("created", "mine"):
+            pkgs = userpkg.UserPkgStore(self.vos).all()
+            if not pkgs:
+                return "(no agent-created packages yet)", "", 0
+            installed = set(self.vos.installed_packages())
+            rows = ["  NAME          VERSION   COMMANDS"]
+            for n in sorted(pkgs):
+                p = pkgs[n]
+                mark = "*" if n in installed else " "
+                cmds = ", ".join(sorted(p.commands)) or "-"
+                rows.append(f"  {mark:<1}{n:<13}{p.version:<10}{cmds}")
+            return "\n".join(rows) + "\n  (* installed)", "", 0
+        if sub == "source":
+            if len(args) < 2:
+                return "pkg: source requires a package name", "", 1
+            p = userpkg.UserPkgStore(self.vos).get(args[1])
+            if not p:
+                return f"pkg: no agent-created package: {args[1]}", "", 1
+            out = [f"# {p.name} {p.version} - {p.description}"]
+            for fpath, content in sorted(p.files.items()):
+                out.append(f"\n--- file: {fpath} ---\n{content}")
+            for cname, spec in sorted(p.commands.items()):
+                out.append(f"\n--- command: {cname} ---\n# {spec.get('help','')}")
+                out.extend(spec.get("body", []))
+            return "\n".join(out), "", 0
+        if sub == "delete":
+            if len(args) < 2:
+                return "pkg: delete requires a package name", "", 1
+            name = args[1]
+            store = userpkg.UserPkgStore(self.vos)
+            if not store.exists(name):
+                return f"pkg: no agent-created package: {name}", "", 1
+            if name in self.vos.installed_packages():
+                self.run(f"pkg remove {name}", _record=False)
+            try:
+                store.remove(name)
+            except userpkg.UserPkgError as e:
+                return f"pkg: {e}", "", 1
+            self.vos.syslog.write("vos-pkg", f"deleted user package {name}")
+            return f"Deleted agent-created package {name}", "", 0
         return f"pkg: unknown subcommand: {sub}", "", 1
+
+    def cmd_snapshot(self, args, stdin):
+        """Filesystem snapshots — the undo button for the whole vOS."""
+        store = self.snapshots
+        action = args[0] if args else "list"
+
+        if action in ("list", "ls"):
+            snaps = store.list()
+            if not snaps:
+                return ("(no snapshots yet — 'snapshot save <name>' takes one)",
+                        "", 0)
+            width = max([len(s["name"]) for s in snaps] + [16])
+            lines = [f"  {'NAME':<{width}}  {'AGE':<9} {'FILES':>5}  {'SIZE':<9} LABEL"]
+            for s in snaps:
+                lines.append(
+                    f"  {s['name']:<{width}}  {snapmod.fmt_age(s['created']):<9} "
+                    f"{s['files']:>5}  {snapmod.fmt_size(s['bytes']):<9} {s.get('label', '')}"
+                )
+            lines.append(f"  ({len(snaps)} snapshot(s), "
+                         f"{snapmod.fmt_size(store.total_bytes())} total)")
+            return "\n".join(lines), "", 0
+
+        if action in ("save", "take", "create"):
+            name = args[1] if len(args) > 1 else None
+            label = " ".join(args[2:]) if len(args) > 2 else ""
+            try:
+                meta = store.save(name, label=label)
+            except snapmod.SnapshotError as e:
+                return "", f"snapshot: {e}", 1
+            return (f"saved snapshot '{meta['name']}' "
+                    f"({meta['files']} files, {snapmod.fmt_size(meta['bytes'])})"), "", 0
+
+        if action in ("rollback", "restore"):
+            if len(args) < 2:
+                return "", "snapshot: rollback needs a name (see 'snapshot list')", 1
+            try:
+                meta = store.rollback(args[1])
+            except snapmod.SnapshotError as e:
+                return "", f"snapshot: {e}", 1
+            # The rootfs was swapped underneath us; cwd may no longer exist.
+            if not self.vos.is_dir(self.cwd):
+                self.cwd = "/"
+            return (f"rolled back to '{meta['name']}'. "
+                    f"Previous state saved as '{meta['undo']}' — "
+                    f"'snapshot rollback {meta['undo']}' to undo this."), "", 0
+
+        if action in ("rm", "remove", "delete"):
+            if len(args) < 2:
+                return "", "snapshot: rm needs a name", 1
+            try:
+                store.remove(args[1])
+            except snapmod.SnapshotError as e:
+                return "", f"snapshot: {e}", 1
+            return f"removed snapshot '{args[1]}'", "", 0
+
+        return "", (f"snapshot: unknown action '{action}' "
+                    f"(use: list, save, rollback, rm)"), 1
 
     def cmd_service(self, args, stdin):
         if not args:
@@ -669,13 +1250,21 @@ class Shell:
                 SERVICE_DEFS[name]["binary"], SERVICE_DEFS[name]["cmdline"], service=name
             )
             self.vos.write(f"/var/run/{name}.pid", f"{pid}\n")
+            # Remember it so a reboot brings it back up.
+            self.vos.set_enabled_service(name, {
+                "binary": SERVICE_DEFS[name]["binary"],
+                "cmdline": SERVICE_DEFS[name]["cmdline"],
+            })
+            self.vos.syslog.service(name, f"started (pid {pid})")
             return f"{name} started (pid {pid})", "", 0
         if action == "stop":
+            self.vos.set_enabled_service(name, None)
             if self.vos.stop_service(name):
                 try:
                     self.vos.remove(f"/var/run/{name}.pid")
                 except (VOSPathError, VOSFsError):
                     pass
+                self.vos.syslog.service(name, "stopped")
                 return f"{name} stopped", "", 0
             return f"service {name} is not running", "", 0
         state = self.vos.service_state(name)

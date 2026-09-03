@@ -258,3 +258,20 @@ def build_registry() -> dict[str, Package]:
         _nginx_pkg(), _git_pkg(), _ssh_pkg(),
     ]
     return {p.name: p for p in pkgs}
+
+
+def full_registry(vos):
+    """Built-in packages plus any the agent authored at runtime.
+
+    User packages are layered on top but can never replace a built-in —
+    UserPkgStore.create refuses those names — so shadowing is impossible.
+    """
+    reg = build_registry()
+    try:
+        from .userpkg import UserPkgStore
+        for name, pkg in UserPkgStore(vos).all().items():
+            if name not in reg:
+                reg[name] = pkg
+    except Exception:
+        pass
+    return reg

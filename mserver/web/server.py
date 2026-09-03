@@ -6,16 +6,76 @@ Two surfaces:
 """
 from __future__ import annotations
 
-import html
 import hmac
+import html
 import json
 import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from ..vos.kernel import OS_NAME, OS_VERSION, SHELL_VERSION
 from ..vos import packages as pkgmod
+from ..vos.kernel import OS_NAME, OS_VERSION, SHELL_VERSION
+
+
+class RateLimiter:
+    """Per-client rate limiting for the chat endpoint.
+
+    The dashboard binds 0.0.0.0 so other devices on the LAN can watch it,
+    which means the chat endpoint is reachable by anything on the network.
+    Two separate budgets:
+
+    * a request budget, so one client cannot pin the agent (each turn can
+      run tools and cost API credits), and
+    * a stricter failure budget, because the realistic attack on this
+      endpoint is guessing the token.
+    """
+
+    def __init__(self, max_requests: int = 20, window: float = 60.0,
+                 max_failures: int = 5, lockout: float = 300.0):
+        self.max_requests = max_requests
+        self.window = window
+        self.max_failures = max_failures
+        self.lockout = lockout
+        self._hits: dict[str, list[float]] = {}
+        self._fails: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def _prune(self, store: dict, client: str, window: float) -> list:
+        now = time.time()
+        kept = [t for t in store.get(client, []) if now - t < window]
+        if kept:
+            store[client] = kept
+        else:
+            store.pop(client, None)
+        return kept
+
+    def check(self, client: str) -> tuple[bool, int]:
+        """Record a request. Returns (allowed, seconds_to_wait)."""
+        with self._lock:
+            now = time.time()
+            fails = self._prune(self._fails, client, self.lockout)
+            if len(fails) >= self.max_failures:
+                return False, int(self.lockout - (now - fails[0])) + 1
+            hits = self._prune(self._hits, client, self.window)
+            if len(hits) >= self.max_requests:
+                return False, int(self.window - (now - hits[0])) + 1
+            self._hits.setdefault(client, []).append(now)
+            return True, 0
+
+    def fail(self, client: str) -> None:
+        with self._lock:
+            self._fails.setdefault(client, []).append(time.time())
+
+    def reset(self, client: str | None = None) -> None:
+        with self._lock:
+            if client is None:
+                self._hits.clear()
+                self._fails.clear()
+            else:
+                self._hits.pop(client, None)
+                self._fails.pop(client, None)
+
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8">
@@ -152,6 +212,7 @@ class Dashboard:
         self.host = host
         self.agent = agent
         self.token = token or secrets.token_urlsafe(8)
+        self.limiter = RateLimiter()
         self.mode_label = "…"
         self._server = None
         self._thread = None
@@ -214,8 +275,18 @@ class Dashboard:
                 except (ValueError, OSError):
                     self._json(400, {"ok": False, "error": "bad JSON body"})
                     return
+                client = self.client_address[0] if self.client_address else "?"
+                allowed, retry_in = dash.limiter.check(client)
+                if not allowed:
+                    self._json(429, {"ok": False,
+                                     "error": f"too many requests — wait {retry_in}s"})
+                    return
                 if not isinstance(body, dict) or not hmac.compare_digest(
                         str(body.get("token", "")), dash.token):
+                    # Count failures separately: token guessing is the attack
+                    # this endpoint actually faces.
+                    dash.limiter.fail(client)
+                    dash.log_auth(f"failed chat auth from {client}")
                     self._json(401, {"ok": False, "error": "bad token (it's printed in the terminal)"})
                     return
                 message = str(body.get("message", "")).strip()
@@ -242,6 +313,13 @@ class Dashboard:
             self._server.server_close()
             self._server = None
             self._thread = None
+
+    def log_auth(self, message: str) -> None:
+        """Record an authentication event in the vOS auth log."""
+        try:
+            self.vos.syslog.auth(message)
+        except Exception:
+            pass
 
     def url(self) -> str:
         return f"http://localhost:{self.port}"
@@ -273,7 +351,7 @@ class Dashboard:
         ])
 
         installed = set(vos.installed_packages())
-        registry = pkgmod.build_registry()
+        registry = pkgmod.full_registry(vos)
         pkg_rows = "".join(
             f"<tr><td>{html.escape(n)}</td><td class='dim'>{html.escape(registry[n].version)}</td>"
             f"<td class='{'ok' if n in installed else 'dim'}'>{'installed' if n in installed else '—'}</td></tr>"

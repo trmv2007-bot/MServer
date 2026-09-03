@@ -5,9 +5,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from mserver.agent.tools import build_tools  # noqa: E402
 from mserver.vos.kernel import VOS  # noqa: E402
 from mserver.vos.shell import Shell  # noqa: E402
-from mserver.agent.tools import build_tools  # noqa: E402
 
 
 def _ctx():

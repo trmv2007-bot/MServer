@@ -10,8 +10,10 @@ import json
 import os
 import shutil
 import time
-from datetime import datetime
 from pathlib import Path
+
+from .procfs import ProcFS
+from .syslog import BOOT_SEQUENCE, SysLog
 
 OS_NAME = "MServerOS"
 OS_VERSION = "1.0"
@@ -59,6 +61,8 @@ class VOS:
         self.next_pid = 10
         self.processes: dict[int, dict] = {}
         self.services: dict[str, dict] = {}
+        self.procfs = ProcFS(self)
+        self.syslog = SysLog(self, hostname)
         self._boot()
 
     # ------------------------------------------------------------- booting
@@ -75,6 +79,17 @@ class VOS:
         self.add_process("init", "init: /sbin/init (MServerOS 1.0)")
         self.add_process("mserver", "mserver: termux session")
         self.add_process("mserver-agent", "mserver-agent: ai core")
+        self._log_boot()
+        started = self.start_enabled_services()
+        for name in started:
+            self.syslog.service(name, "started at boot")
+
+    def _log_boot(self) -> None:
+        self.syslog.clear_ring()
+        for line in BOOT_SEQUENCE:
+            self.syslog.kernel(line)
+        self.syslog.boot(list(BOOT_SEQUENCE))
+        self.syslog.write("kernel", f"{OS_NAME} {OS_VERSION} booted")
 
     def reboot(self) -> None:
         self.boot_time = time.time()
@@ -83,6 +98,57 @@ class VOS:
         self.add_process("init", "init: /sbin/init (MServerOS 1.0)")
         self.add_process("mserver", "mserver: termux session")
         self.add_process("mserver-agent", "mserver-agent: ai core")
+        self.syslog.write("kernel", "system reboot requested")
+        self._log_boot()
+        for name in self.start_enabled_services():
+            self.syslog.service(name, "restarted after reboot")
+
+    # ------------------------------------------------------------- services
+    def _svcfile(self) -> Path:
+        return self.vpath("/var/lib/vos/services.json")
+
+    def enabled_services(self) -> dict:
+        """Services marked to start at boot, as {name: {binary, cmdline}}."""
+        f = self._svcfile()
+        if not f.exists():
+            return {}
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (ValueError, OSError):
+            return {}
+
+    def set_enabled_service(self, name: str, defn: dict | None) -> None:
+        """Enable (defn given) or disable (None) a service across reboots."""
+        data = self.enabled_services()
+        if defn is None:
+            data.pop(name, None)
+        else:
+            data[name] = defn
+        f = self._svcfile()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n",
+                     encoding="utf-8")
+
+    def start_enabled_services(self) -> list[str]:
+        """Bring up every enabled service. Called on boot and reboot.
+
+        Previously a reboot silently wiped running services, which made
+        `service nginx start` feel unreliable.
+        """
+        started = []
+        for name, defn in sorted(self.enabled_services().items()):
+            if self.service_state(name) == "running":
+                continue
+            pid = self.add_process(defn.get("binary", name),
+                                   defn.get("cmdline", f"{name}: service"),
+                                   service=name)
+            try:
+                self.write(f"/var/run/{name}.pid", f"{pid}\n")
+            except (VOSPathError, VOSFsError):
+                pass
+            started.append(name)
+        return started
 
     # -------------------------------------------------------- path sandbox
     def vpath(self, p) -> Path:
@@ -99,6 +165,11 @@ class VOS:
             raise VOSPathError(f"path escapes the virtual OS: {p}")
         return target
 
+    def _refuse_procfs_write(self, p) -> None:
+        """/proc is generated, not stored — writing to it is meaningless."""
+        if self.procfs.owns(p):
+            raise VOSFsError(f"read-only filesystem: {p}")
+
     def vname(self, target: Path) -> str:
         try:
             return "/" + str(Path(target).relative_to(self.root))
@@ -107,16 +178,33 @@ class VOS:
 
     # ------------------------------------------------------------ stat ops
     def exists(self, p) -> bool:
+        if self.procfs.owns(p):
+            return self.procfs.exists(p)
         return self.vpath(p).exists()
 
     def is_dir(self, p) -> bool:
+        if self.procfs.owns(p):
+            return self.procfs.is_dir(p)
         return self.vpath(p).is_dir()
 
     def size(self, p) -> int:
+        if self.procfs.owns(p):
+            if self.procfs.is_dir(p):
+                return 4096
+            try:
+                return len(self.procfs.read(p))
+            except (KeyError, IsADirectoryError):
+                return 0
         f = self.vpath(p)
         return 4096 if f.is_dir() else f.stat().st_size
 
     def listdir(self, p) -> list[dict]:
+        if self.procfs.owns(p):
+            self.vpath(p)
+            try:
+                return self.procfs.listdir(p)
+            except KeyError as e:
+                raise VOSFsError(f"not a directory: {p}") from e
         d = self.vpath(p)
         if not d.is_dir():
             raise VOSFsError(f"not a directory: {p}")
@@ -142,6 +230,15 @@ class VOS:
 
     # ------------------------------------------------------------ content
     def read(self, p) -> str:
+        # /proc is generated on read, never stored.
+        if self.procfs.owns(p):
+            self.vpath(p)  # still enforce the sandbox on the path itself
+            try:
+                return self.procfs.read(p)
+            except IsADirectoryError as e:
+                raise VOSFsError(f"is a directory: {p}") from e
+            except KeyError as e:
+                raise VOSFsError(f"no such file: {p}") from e
         f = self.vpath(p)
         if f.is_dir():
             raise VOSFsError(f"is a directory: {p}")
@@ -150,6 +247,7 @@ class VOS:
         return f.read_text(encoding="utf-8", errors="replace")
 
     def write(self, p, content: str, create_dirs: bool = True) -> int:
+        self._refuse_procfs_write(p)
         f = self.vpath(p)
         if create_dirs:
             f.parent.mkdir(parents=True, exist_ok=True)
@@ -157,20 +255,24 @@ class VOS:
         return len(content.encode("utf-8"))
 
     def append(self, p, text: str) -> None:
+        self._refuse_procfs_write(p)
         f = self.vpath(p)
         f.parent.mkdir(parents=True, exist_ok=True)
         with f.open("a", encoding="utf-8") as fh:
             fh.write(text)
 
     def mkdir(self, p) -> None:
+        self._refuse_procfs_write(p)
         self.vpath(p).mkdir(parents=True, exist_ok=True)
 
     def touch(self, p) -> None:
+        self._refuse_procfs_write(p)
         f = self.vpath(p)
         f.parent.mkdir(parents=True, exist_ok=True)
         f.touch()
 
     def remove(self, p) -> None:
+        self._refuse_procfs_write(p)
         f = self.vpath(p)
         if not f.exists():
             raise VOSFsError(f"no such path: {p}")
@@ -180,6 +282,7 @@ class VOS:
             f.unlink()
 
     def copy(self, src, dst) -> None:
+        self._refuse_procfs_write(dst)
         s, d = self.vpath(src), self.vpath(dst)
         if d.is_dir():
             d = d / s.name
@@ -190,6 +293,8 @@ class VOS:
             shutil.copy2(s, d)
 
     def move(self, src, dst) -> None:
+        self._refuse_procfs_write(src)
+        self._refuse_procfs_write(dst)
         s, d = self.vpath(src), self.vpath(dst)
         if d.is_dir():
             d = d / s.name

@@ -32,6 +32,8 @@ mserver ❯ install nginx, make a welcome page, start it and show me the site
 
 No pip packages. Pure Python 3 stdlib — everything runs from `pkg install python`.
 
+**Requires Python 3.10 or newer.**
+
 ## Quick start (Termux)
 
 ```sh
@@ -42,6 +44,13 @@ bash run.sh
 ```
 
 Or simply `bash run.sh` if you already have `python3`.
+
+Installing as a command instead:
+
+```sh
+pipx install .     # or: pip install .
+mserver --web
+```
 
 ## Using the agent
 
@@ -69,6 +78,11 @@ Set an API key before starting — works with **any OpenAI-compatible endpoint**
 | `MOPENAI_BASE_URL` | `https://api.openai.com/v1` | endpoint base URL |
 | `MOPENAI_MODEL` | `gpt-4o-mini` | model name |
 | `MSERVER_TOKEN` | *(random per start)* | token that unlocks the dashboard chat |
+| `MSERVER_MAX_CONTEXT` | `8000` | context budget in tokens before compaction |
+| `MOPENAI_TIMEOUT` | `180` | per-request timeout in seconds |
+| `MOPENAI_RETRIES` | `3` | retries on 429 / 5xx / network errors |
+| `MSERVER_NET` | unset | set to `1` to let the agent download from the internet (same as `--net`) |
+| `MSERVER_NET_ALLOW` | unset | comma-separated host allow-list for `--net`, e.g. `docs.python.org,pypi.org` |
 
 ```sh
 export MOPENAI_API_KEY=sk-...
@@ -89,13 +103,22 @@ still work, and `!` direct shell always does.
   (`~/.mserver/vos` by default). Path traversal is rejected, no command ever
   reaches the real Android shell, and the device filesystem is never touched.
 - **Shell**: `ls cd pwd cat echo mkdir touch rm cp mv grep head tail wc find
-  env ps kill reboot clear history which free df neofetch date uptime uname
-  whoami hostname pkg service help` + pipes `|`, redirection `>` `>>`, globs `* ? [`.
+  sort uniq cut tr rev tee seq yes true false basename dirname stat du
+  dmesg logger
+  env export unset alias unalias source man ps kill reboot clear history
+  which free df neofetch date uptime uname whoami hostname pkg service
+  snapshot help`
+- **Shell syntax**: pipes `|`, redirection `>` `>>`, globs `* ? [`,
+  sequencing `;`, conditionals `&&` `||`, and variable expansion
+  (`$HOME`, `${VAR}`, `$?`) — single quotes stay literal.
+- `/root/.mshrc` is sourced at startup (aliases, exports) and history
+  persists to `/root/.msh_history`.
 - **Packages** (`pkg list`): `hello`, `cowsay`, `figlet`, `nginx`, `git`, `ssh`.
   Installing drops real files into the vOS and registers shell commands;
   the install list persists across restarts.
-- **Services** (`service ssh start`, `service nginx stop`): show up in `ps`,
-  survive until `reboot`.
+- **Services** (`service ssh start`, `service nginx stop`): show up in `ps`
+  and are re-started automatically after a `reboot` or a restart, until you
+  `service <name> stop` them.
 
 ## Web dashboard
 
@@ -131,15 +154,24 @@ needs the token. Set `MSERVER_TOKEN` yourself to use a fixed one.
 MServer/
 ├── run.sh                 # launcher (python3 -m mserver)
 ├── termux-setup.sh        # Termux one-shot setup
+├── pyproject.toml         # packaging, ruff + pytest config
 ├── mserver/
 │   ├── main.py            # CLI, REPL, slash commands
+│   ├── _compat.py         # Python 3.10+ guard
 │   ├── vos/
 │   │   ├── kernel.py      # sandboxed rootfs, processes, services
+│   │   ├── procfs.py      # synthetic /proc, generated on read
+│   │   ├── syslog.py      # /var/log + dmesg ring buffer
+│   │   ├── userpkg.py     # packages the agent writes for itself
 │   │   ├── shell.py       # msh interpreter
+│   │   ├── snapshots.py   # filesystem snapshots / rollback
 │   │   └── packages.py    # pkg registry (cowsay, nginx, git, …)
 │   ├── agent/
 │   │   ├── core.py        # agent loop + offline planner
 │   │   ├── tools.py       # the agent's hands (all sandboxed)
+│   │   ├── context.py     # context compaction (mask/dedupe/purge)
+│   │   ├── audit.py       # tool-call audit log + doom-loop guard
+│   │   ├── risk.py        # tool risk tiers + confirmation gate
 │   │   ├── llm.py         # OpenAI-compatible client (stdlib urllib)
 │   │   └── ui.py          # ANSI panels, banner, tool trace
 │   └── web/server.py      # dashboard (http.server, thread)
@@ -153,21 +185,250 @@ MServer/
 - **New agent tool**: add an executor + schema in `mserver/agent/tools.py` —
   the agent picks it up automatically.
 
+## Long sessions
+
+The agent keeps its conversation inside a token budget so a long session does
+not grow unbounded (which costs quadratically and eventually gets rejected by
+the endpoint). At 80% of `MSERVER_MAX_CONTEXT` three deterministic passes run —
+no extra model calls:
+
+1. **dedupe** — a repeated `(tool, args)` call keeps only its newest result
+2. **error purging** — a failure that a later identical call resolved is collapsed
+3. **observation masking** — older long tool outputs become
+   `[output: ~N tokens, masked]`, keeping the action and reasoning
+
+The system prompt is never modified and no message is ever dropped, so
+`tool_call_id` pairing stays intact and the prompt prefix stays cache-stable.
+Compaction is reported in the terminal as `⋯ context compacted: 7082→1583 tokens`.
+
+MServer also nudges the agent out of **doom loops**: the same tool called with
+identical arguments three times in a 20-call window gets a warning appended to
+the result telling it to change approach.
+
+## Keeping it alive on Android
+
+Android will kill a Termux session that it thinks is idle. If MServer keeps
+dying in the background, it is almost always one of these:
+
+| Problem | Fix |
+| --- | --- |
+| Termux from the Play Store is deprecated | Install from **F-Droid** or the GitHub releases |
+| CPU sleeps when the screen goes off | `termux-wake-lock` (needs Termux:API), or "Acquire WakeLock" in the notification |
+| Session dies when you swipe the app away | Run inside **tmux**: `pkg install tmux && tmux new -s mserver`, then detach with `Ctrl-b` `d` |
+| Battery optimiser kills it after minutes | Settings → Battery → Termux → **Unrestricted** |
+| Xiaomi / OPPO / Vivo / Huawei still kill it | Whitelist Termux in the *manufacturer's* battery manager too — MIUI, ColorOS etc. override the Android setting |
+| Android 12+ kills child processes | The Phantom Process Killer reaps processes the system did not start. Raise the limit over ADB: `adb shell settings put global settings_enable_monitor_phantom_procs false` |
+
+Expect roughly **2–5% battery per hour** with a wakelock held and the agent
+idle. Never enable Power Saving Mode while a session is running — it overrides
+the wakelock.
+
+```sh
+pkg install tmux
+termux-wake-lock
+tmux new -s mserver
+bash run.sh --web
+# Ctrl-b then d to detach; `tmux attach -t mserver` to come back
+```
+
+## Snapshots — the undo button
+
+The whole vOS is one directory, so it can be snapshotted and restored wholesale.
+This is the safety net for letting an agent write to a filesystem:
+
+```
+mserver ❯ !snapshot save before-cleanup
+saved snapshot 'before-cleanup' (8 files, 478 B)
+mserver ❯ !rm -rf /root
+mserver ❯ !snapshot rollback before-cleanup
+rolled back to 'before-cleanup'. Previous state saved as 'auto-…' — rollback that to undo this.
+```
+
+`snapshot list | save <name> [label] | rollback <name> | rm <name>`
+
+Snapshots live **outside** the rootfs, so the agent cannot see or delete them —
+an undo history reachable by `rm -rf /` would not be one. Rolling back always
+saves the pre-rollback state first, so a rollback is itself undoable. The agent
+has `snapshot_save` / `snapshot_rollback` / `snapshot_list` tools too.
+
+## Destructive actions
+
+Tools are classified by risk: **read** (`vos_read`, `vos_list`, …), **write**
+(`vos_write`, `vos_edit`, `pkg_install`, …) and **destructive** (`vos_delete`,
+`rm`, `snapshot_rollback`). Destructive calls are gated by a deterministic
+check on the tool and its arguments — not by asking the model to behave. `rm`
+is caught even when hidden behind a pipe or `;`.
+
+| Mode | Flag | Behaviour |
+| --- | --- | --- |
+| ask *(default)* | — | prompts on the terminal before each destructive call |
+| allow | `--yolo` | never asks — for scripted/headless runs |
+| deny | `--safe` | refuses every destructive call |
+
+```
+  ⚠ THIS WOULD ERASE A LARGE PART OF THE vOS
+  The agent wants to: run: rm -rf /etc
+  Allow? [y/N]
+```
+
+A snapshot is taken automatically before an approved wipe, so even "yes" is
+recoverable. The dashboard chat cannot prompt, so it **fails closed** and
+refuses destructive calls rather than performing them unattended.
+
+## /proc and system logs
+
+`/proc` is generated on read, never stored — `cat /proc/uptime` twice gives two
+different answers, and a service started a second ago is already there:
+
+```
+mserver ❯ !cat /proc/loadavg
+0.08 0.03 0.01 1/4 13
+mserver ❯ !grep MemTotal /proc/meminfo
+MemTotal:            2097152 kB
+mserver ❯ !cat /proc/self/comm
+mserver-agent
+mserver ❯ !cat /proc/13/status
+Name:           nginx
+State:          S (sleeping)
+Service:        nginx
+```
+
+`uptime meminfo cpuinfo loadavg version mounts filesystems stat self/ <pid>/`
+with `cmdline`, `comm`, `stat` and `status` per process. The overlay is
+read-only — writes to `/proc` are refused.
+
+`/var/log` fills as the system runs:
+
+| File | Contents |
+| --- | --- |
+| `syslog` | boot, services, package installs, `logger` messages |
+| `boot.log` | the most recent boot sequence |
+| `auth.log` | dashboard authentication attempts |
+| `<service>.log` | per-service start/stop |
+| `agent.log` | every agent tool call |
+
+`dmesg` prints the kernel ring buffer (rebuilt each boot) and `logger <msg>`
+writes to syslog. All logs are size-capped and rotate in place.
+
+
+## The agent writes its own software
+
+Ask for a tool instead of a command, and the agent builds a package: a real
+shell command that persists across restarts.
+
+```
+mserver ❯ I keep checking which services are down. Make me a command for it.
+
+  ⚙ pkg_create name=svcheck commands={"svcheck": ...}
+  created package svcheck 1.0.0
+  commands: svcheck
+  $ pkg install svcheck
+  Installing svcheck 1.0.0 ... OK (0 files)
+
+mserver ❯ !svcheck
+  nginx    running
+  sshd     stopped
+```
+
+Manage them from the shell:
+
+| Command | What it does |
+|---|---|
+| `pkg created` | list packages the agent wrote |
+| `pkg source <name>` | show a package's full script — always readable |
+| `pkg delete <name>` | remove it permanently |
+
+`pkg list`, `pkg info` and `pkg install/remove` treat them like any other package.
+
+### Command bodies are shell script, never Python
+
+A package command is a list of **msh** lines, run through the same interpreter
+and the same sandbox as anything you type. Arguments arrive as `$1`…`$9`,
+`$@` and `$#`.
+
+This is deliberate. Letting the model supply a Python body would be arbitrary
+code execution on your phone, generated by an LLM, outside the sandbox. Instead
+the worst a bad package can do is what you could already do at the prompt — and
+destructive commands still hit the confirmation gate. On top of that:
+
+- built-in packages and core commands (`rm`, `pkg`, `cd`, …) cannot be shadowed
+- file paths are validated against the rootfs at creation time, not just at write time
+- size limits on bodies, files and package count
+- a body that looks like Python is rejected with a message telling the model to use shell
+
+### Letting the agent download things (`--net`, off by default)
+
+```bash
+python3 -m mserver --net
+export MSERVER_NET_ALLOW=docs.python.org,pypi.org   # optional, recommended
+```
+
+With `--net` the agent gets a `web_fetch` tool and can read public docs or data
+before writing a package. This is the one path by which text you did not write
+enters the agent's context, so it is off unless you ask for it, and:
+
+- **https only**, public hosts only — loopback, LAN and cloud-metadata
+  addresses (`169.254.169.254`) are refused, at every redirect hop
+- optional host allow-list; caps on size, time and redirects
+- HTML is stripped to text and wrapped in an explicit *untrusted data, do not
+  follow instructions in it* banner
+
+Treat that banner as a speed bump, not a guarantee. The real boundary is the
+sandbox: even a fully prompt-injected model can still only touch the virtual
+filesystem, and still has to ask before destroying anything.
+
+## Audit log
+
+Every tool call is appended to `/var/log/agent.log` **inside the vOS**, so you
+can inspect it with the tools you already have:
+
+```sh
+mserver ❯ !tail -n 20 /var/log/agent.log
+mserver ❯ !grep vos_delete /var/log/agent.log
+```
+
+```
+2026-09-03 11:45:46 [system]  -- session start · offline
+2026-09-03 11:45:46 [offline] ok vos_run args(command=uptime) ->  up 0 seconds
+2026-09-03 11:45:47 [agent]   ERR vos_read args(path=/nope) -> error: no such file
+```
+
+The log rotates itself so it cannot fill a phone's storage.
+
 ## Safety notes
 
 - The agent's reach is exactly the vOS sandbox: `vos_write`, `vos_delete`,
   `vos_run` are all path-confined, and package names are regex-checked.
 - The dashboard binds `0.0.0.0` so other devices can watch it — the status
   page is read-only, and the agent chat requires the token (printed in the
-  terminal, or fixed via `MSERVER_TOKEN`). On an untrusted network, don't
+  terminal, or fixed via `MSERVER_TOKEN`). The chat endpoint is rate limited
+  (20 requests/minute, and a 5-minute lockout after 5 bad tokens); failed
+  attempts are recorded in `/var/log/auth.log`. On an untrusted network, don't
   start the dashboard or use `--host 127.0.0.1`.
 - The LLM key only leaves the phone to the endpoint you configure.
 - `--data DIR` moves the sandbox anywhere you like.
 
 ## Tests
 
+Dependency-free — each suite runs as a plain script:
+
 ```sh
 python3 tests/test_vos.py
 python3 tests/test_tools.py
 python3 tests/test_web.py
+python3 tests/test_context.py
+python3 tests/test_safety.py
+python3 tests/test_shell2.py
+python3 tests/test_procfs.py
+python3 tests/test_userpkg.py
 ```
+
+Or all at once, if you have pytest:
+
+```sh
+python3 -m pytest tests/ -v
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE). Planned work is tracked in [ROADMAP.md](ROADMAP.md).
