@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a new capability, command, or improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        What would you like MServer to do? Check the
+        [ROADMAP](https://github.com/trmv2007-bot/MServer/blob/main/ROADMAP.md)
+        first — it may already be planned.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that MServer can't do today?
+      placeholder: "I want to ... but ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How should it behave? Feel free to sketch commands or a UX.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you already tried.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues before filing this request
+          required: true
+        - label: This works inside the vOS / agent model in spirit (no host RCE)
+          required: true

@@ -1,6 +1,6 @@
 # MServer Roadmap
 
-Status: **the application is complete and working.** All 18 tests pass, the vOS
+Status: **the application is complete and working.** All 498 tests pass, the vOS
 sandbox holds against path traversal, state persists across restarts, and the
 dashboard, offline planner, package system and service manager all work end to
 end. What follows is not a rescue plan — it is the gap between "works" and
@@ -23,14 +23,14 @@ Confirmed by running the code, not by reading it:
   — correct practice, no change needed.
 - Full REPL flow: `pkg install` → `service start` → visible in `ps`,
   redirection, globs, pipes, `neofetch`, slash commands.
-- 18 tests across 3 suites, all green.
+- 498 tests across 13 suites, all green.
 
 ---
 
 ## Tier 0 — Necessary ✅ COMPLETE
 
 These either prevented a guaranteed failure or blocked adoption. All five
-shipped; the suite went from 18 tests to 36.
+shipped; the suite has since grown from 18 tests to 498.
 
 ### 0.1 Context compaction **[bug]** — ✅ done
 `Agent.messages` grows without bound. Every turn re-sends the full history, so
@@ -72,13 +72,14 @@ No license means "all rights reserved" despite a README that invites cloning
 and extending. Blocks any outside contribution.
 
 ### 0.5 CI — ✅ written, needs one manual step
-No `.github/` at all. 18 good tests that nothing runs automatically. A version
+No `.github/` at all; 18 good tests that nothing ran automatically. A version
 matrix would have caught 0.2 on its own.
 
 The pipeline is written and verified, but lives at `ci/github-actions-ci.yml`:
 the automation account lacks the GitHub `workflows` permission and cannot push
-into `.github/workflows/`. Activating it is a one-line `git mv` by a human with
-write access — see `ci/README.md`.
+into `.github/workflows/` (verified: both git push and the contents API are
+refused with HTTP 403). Activating it is a one-line `git mv` by a human with
+an owner token — see `ci/README.md`.
 
 ---
 
@@ -264,10 +265,11 @@ snapshot UI, artifact rendering as HTML, mobile layout pass.
 9. ~~**Users + permissions**~~ — done, 83 new tests.
 10. ~~**Dashboard SSE + web terminal**~~ — done, 44 new tests.
 11. ~~**`SECURITY.md`**~~ — done, plus `--version` and a wipe-recovery fix.
-12. Next: **activate CI** — still blocked on a human `git mv`, and now ten
-    commits deep with 449 tests that have never run anywhere but a dev
-    machine. Then `CONTRIBUTING.md`/`CHANGELOG.md`, then signals and disk
-    quotas, then the Tier 3 curses TUI.
+12. **Activate CI** — still blocked on the `workflows` permission; the file
+    is ready at `ci/github-actions-ci.yml` and needs one `git mv` by a human
+    with an owner token (see `ci/README.md`).
+13. ~~**`CONTRIBUTING.md` / `CHANGELOG.md` / templates / `.editorconfig`**~~ —
+    ✅ done. Next: signals and disk quotas, then the Tier 3 curses TUI.
 
 Open follow-ups from users: no passwords, so `su` to a *lower* privilege is
 free and `sudo` is a deliberate-intent marker rather than authentication; no
@@ -294,8 +296,10 @@ which is exactly why snapshots and the audit log come first.
 
 ## Housekeeping backlog
 
-`CONTRIBUTING.md`, `CHANGELOG.md`, issue/PR templates, `.editorconfig`,
-dashboard screenshots or a demo GIF.
+~~`CONTRIBUTING.md`~~ — ✅ done. ~~`CHANGELOG.md`~~ — ✅ done. ~~issue/PR
+templates~~ — ✅ done. ~~`.editorconfig`~~ — ✅ done.
+
+Still open: dashboard screenshots or a demo GIF.
 
 ~~`SECURITY.md`~~ — ✅ done. Threat model, the ten controls and their
 enforcement points, known limitations (prompt injection, `0.0.0.0` binding,

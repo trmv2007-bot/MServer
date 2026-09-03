@@ -1,0 +1,79 @@
+name: Bug report
+description: Report a defect in MServer (not a feature request)
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please fill in the details below — a small,
+        complete reproduction is the fastest path to a fix.
+
+  - type: input
+    id: version
+    attributes:
+      label: MServer version
+      description: Output of `mserver --version`
+      placeholder: e.g. 1.0.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: Where are you running MServer?
+      options:
+        - Termux on Android
+        - Android (other)
+        - Linux desktop
+        - macOS
+        - Windows (WSL)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS / Android version
+      placeholder: e.g. Android 14, LineageOS 21; or Debian 12
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you see instead?
+      placeholder: |
+        Expected: ...
+        Actual:   ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest set of steps (or REPL input) that triggers it.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: Tool trace, traceback, or `tail /var/log/*` output.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues before filing this report
+          required: true
+        - label: This is a bug, not a feature request or a question
+          required: true
