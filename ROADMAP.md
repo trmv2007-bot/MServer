@@ -263,11 +263,11 @@ snapshot UI, artifact rendering as HTML, mobile layout pass.
 8. ~~**`cron`/`at`**~~ — done, 85 new tests.
 9. ~~**Users + permissions**~~ — done, 83 new tests.
 10. ~~**Dashboard SSE + web terminal**~~ — done, 44 new tests.
-11. Next: the housekeeping that keeps being deferred — activate CI (needs a
-    human `git mv`), then `SECURITY.md`, which is now well overdue: the
-    threat model spans sandbox, gate, permissions, network egress, unattended
-    scheduled execution and a browser-facing terminal. After that: signals
-    and disk quotas, then the Tier 3 curses TUI.
+11. ~~**`SECURITY.md`**~~ — done, plus `--version` and a wipe-recovery fix.
+12. Next: **activate CI** — still blocked on a human `git mv`, and now ten
+    commits deep with 449 tests that have never run anywhere but a dev
+    machine. Then `CONTRIBUTING.md`/`CHANGELOG.md`, then signals and disk
+    quotas, then the Tier 3 curses TUI.
 
 Open follow-ups from users: no passwords, so `su` to a *lower* privilege is
 free and `sudo` is a deliberate-intent marker rather than authentication; no
@@ -294,8 +294,13 @@ which is exactly why snapshots and the audit log come first.
 
 ## Housekeeping backlog
 
-`CONTRIBUTING.md`, `SECURITY.md` (warranted — this ships an LLM agent with
-filesystem access), `CHANGELOG.md`, issue/PR templates, `.editorconfig`,
+`CONTRIBUTING.md`, `CHANGELOG.md`, issue/PR templates, `.editorconfig`,
 dashboard screenshots or a demo GIF.
+
+~~`SECURITY.md`~~ — ✅ done. Threat model, the ten controls and their
+enforcement points, known limitations (prompt injection, `0.0.0.0` binding,
+simulated mode bits, no TLS), a hardening checklist and a scope statement.
+Every claim in it was verified against the running code rather than written
+from memory; doing so turned up two real bugs (see below).
 
 Done in Tier 0: ruff config, pytest entry point, `pipx install` support.

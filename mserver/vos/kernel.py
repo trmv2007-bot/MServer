@@ -103,6 +103,17 @@ class VOS:
 
     def reboot(self) -> None:
         self.boot_time = time.time()
+        # Restore the base skeleton and the account database. Without this a
+        # vOS that had been wiped (`rm -rf /`) came back up with no /etc and
+        # no users at all, which silently disabled the permission layer:
+        # UserDB.enforce stays False when there is nobody to become.
+        self.root.mkdir(parents=True, exist_ok=True)
+        for d in BASE_DIRS:
+            self.vpath(d).mkdir(parents=True, exist_ok=True)
+        for pth, content in BASE_FILES.items():
+            f = self.vpath(pth)
+            if not f.exists():
+                f.write_text(content, encoding="utf-8")
         self.processes.clear()
         self.services.clear()
         self.add_process("init", "init: /sbin/init (MServerOS 1.0)")
@@ -110,6 +121,7 @@ class VOS:
         self.add_process("mserver-agent", "mserver-agent: ai core")
         self.syslog.write("kernel", "system reboot requested")
         self._log_boot()
+        self.users.ensure_seeded()
         for name in self.start_enabled_services():
             self.syslog.service(name, "restarted after reboot")
 

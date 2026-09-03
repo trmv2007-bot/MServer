@@ -27,6 +27,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--local", action="store_true", help="force offline mode (ignore API key)")
     ap.add_argument("--web", action="store_true", help="start the web dashboard alongside the REPL")
     ap.add_argument("--web-only", action="store_true", help="only run the dashboard (no REPL)")
+    ap.add_argument("--version", action="version",
+                    version=f"mserver {__version__}",
+                    help="print the version and exit")
     ap.add_argument("--as-user", metavar="NAME", default=None,
                     help="run the agent as a non-root vOS user (e.g. --as-user "
                          "agent), so it cannot write to /etc even if it tries")

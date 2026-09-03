@@ -280,6 +280,13 @@ A snapshot is taken automatically before an approved wipe, so even "yes" is
 recoverable. The dashboard chat cannot prompt, so it **fails closed** and
 refuses destructive calls rather than performing them unattended.
 
+> **Read [SECURITY.md](SECURITY.md)** before pointing this at anything you
+> care about. It documents the full threat model — sandbox, gate,
+> permissions, network egress, scheduled execution, the web terminal — and,
+> just as importantly, the known limitations. Short version: prompt injection
+> is not solved by anyone, so run with `--as-user agent`, leave `--net` off
+> unless you need it, and do not expose `--web` to an untrusted network.
+
 ## /proc and system logs
 
 `/proc` is generated on read, never stored — `cat /proc/uptime` twice gives two

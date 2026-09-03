@@ -392,6 +392,41 @@ class TestNoRecursion(unittest.TestCase):
             vos.users.check("/etc/passwd", "w", "write")
 
 
+class TestWipeAndRecovery(unittest.TestCase):
+    """A wiped vOS must not come back up with the permission layer disabled."""
+
+    def test_non_root_cannot_delete_passwd(self):
+        vos, shell, _ = new_env(as_user="agent")
+        shell.run("rm /etc/passwd")
+        self.assertTrue(vos.exists("/etc/passwd"))
+
+    def test_non_root_cannot_wipe_etc(self):
+        vos, shell, _ = new_env(as_user="agent")
+        shell.run("rm -rf /etc")
+        self.assertTrue(vos.exists("/etc/passwd"))
+        self.assertTrue(vos.users.enforce)
+
+    def test_reboot_restores_skeleton_after_wipe(self):
+        vos, shell, _ = new_env()
+        shell.run("rm -rf /")
+        shell.run("reboot")
+        self.assertTrue(vos.exists("/etc/passwd"))
+
+    def test_reboot_reseeds_accounts_after_wipe(self):
+        vos, shell, _ = new_env()
+        shell.run("rm -rf /")
+        self.assertEqual(vos.users.users(), [])
+        shell.run("reboot")
+        self.assertIn("agent", [u["name"] for u in vos.users.users()])
+
+    def test_enforcement_works_again_after_wipe_and_reboot(self):
+        vos, shell, _ = new_env()
+        shell.run("rm -rf /")
+        shell.run("reboot")
+        shell.run("su agent")
+        self.assertEqual(shell.run("touch /etc/evil")[2], 1)
+
+
 class TestWhoamiTool(unittest.TestCase):
     def test_reports_root(self):
         vos, shell, _ = new_env()
