@@ -39,8 +39,9 @@ def main(argv=None) -> int:
     vos = VOS(data / "vos")
     shell = Shell(vos)
     ui = UI()
-    dash = Dashboard(vos, shell, artifacts_dir, port=args.port, host=args.host)
     agent = Agent(vos, shell, ui, artifacts_dir, force_local=args.local)
+    dash = Dashboard(vos, shell, artifacts_dir, port=args.port, host=args.host,
+                     agent=agent, token=os.environ.get("MSERVER_TOKEN") or None)
     agent.set_dashboard(dash)
     dash.mode_label = (
         f"AI · {agent.cfg.model}" if not agent.local else "offline · local mode"
@@ -53,10 +54,9 @@ def main(argv=None) -> int:
             ui.println(ui.red(f"  could not start dashboard on {args.host}:{args.port}: {e}"))
             if args.web_only:
                 return 1
-        ui.println(
-            ui.cyan(f"  dashboard → {dash.url()}  ")
-            + ui.dim("(from another device, use the phone's LAN IP: same port)")
-        )
+        ui.println(ui.cyan(f"  dashboard → {dash.url()}"))
+        ui.println(ui.cyan(f"  agent chat → {dash.chat_url()}"))
+        ui.println(ui.dim("  (another device: same paths with the phone LAN IP; the token gates the chat)"))
 
     if args.web_only:
         ui.println(ui.dim("  press ctrl-c to stop"))
@@ -140,10 +140,8 @@ def _slash(line: str, agent: Agent, dash: Dashboard, ui: UI) -> bool:
         if arg in ("on", "start", "toggle") and not dash.running:
             try:
                 dash.start()
-                ui.println(
-                    ui.cyan(f"  dashboard → {dash.url()}  ")
-                    + ui.dim("(another device: phone LAN IP + same port)")
-                )
+                ui.println(ui.cyan(f"  dashboard → {dash.url()}"))
+                ui.println(ui.cyan(f"  agent chat → {dash.chat_url()}"))
             except OSError as e:
                 ui.println(ui.red(f"  dashboard failed: {e}"))
         elif arg in ("off", "stop", "toggle") and dash.running:

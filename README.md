@@ -28,7 +28,7 @@ mserver ❯ install nginx, make a welcome page, start it and show me the site
 | **vOS** (`mserver/vos`) | The "inbuilt Linux": a sandboxed rootfs with an `msh` shell (pipes, redirection, globs), `pkg` manager, `service` manager, process table, `neofetch`, `reboot`, … |
 | **Agent** (`mserver/agent`) | LLM-driven agent with tools (`vos_run`, `vos_read/write`, `pkg_install`, `present`, …). Works with any OpenAI-compatible endpoint. Has an offline mode when no key is set. |
 | **Presentation** | Finished work is shown in a highlighted terminal panel, saved as an artifact (`.mserver/presented/*.md`), and listed on the dashboard. |
-| **Dashboard** (`mserver/web`) | Zero-dependency web UI: system info, processes, storage, packages, recent commands, artifacts. Auto-refreshes. |
+| **Dashboard** (`mserver/web`) | Zero-dependency web UI: system info, processes, storage, packages, recent commands, artifacts, and an **agent chat box**. Auto-refreshes. |
 
 No pip packages. Pure Python 3 stdlib — everything runs from `pkg install python`.
 
@@ -68,6 +68,7 @@ Set an API key before starting — works with **any OpenAI-compatible endpoint**
 | `MOPENAI_API_KEY` | — | API key (or `OPENAI_API_KEY`) |
 | `MOPENAI_BASE_URL` | `https://api.openai.com/v1` | endpoint base URL |
 | `MOPENAI_MODEL` | `gpt-4o-mini` | model name |
+| `MSERVER_TOKEN` | *(random per start)* | token that unlocks the dashboard chat |
 
 ```sh
 export MOPENAI_API_KEY=sk-...
@@ -108,6 +109,22 @@ Open `http://localhost:8686` in the phone browser — or
 (find the IP with `ip route get 1` or in Android settings). The agent can also
 start/stop the dashboard itself via its `dashboard` tool.
 
+### Chat with the agent from the dashboard
+
+The dashboard has an **agent chat** (`/chat`) — the same agent, the same
+conversation, the same vOS as the Termux REPL. Tool calls are rendered as you
+watch, and anything the agent `present`s lands in the Artifacts panel.
+
+Chat is **token-gated**: on startup the terminal prints
+
+```
+agent chat → http://localhost:8686/chat?token=AbCd12…
+```
+
+Open that exact link (or paste the token into the box on the chat page; it is
+remembered in the browser). The status page stays read-only; only the chat
+needs the token. Set `MSERVER_TOKEN` yourself to use a fixed one.
+
 ## Project layout
 
 ```
@@ -140,6 +157,10 @@ MServer/
 
 - The agent's reach is exactly the vOS sandbox: `vos_write`, `vos_delete`,
   `vos_run` are all path-confined, and package names are regex-checked.
+- The dashboard binds `0.0.0.0` so other devices can watch it — the status
+  page is read-only, and the agent chat requires the token (printed in the
+  terminal, or fixed via `MSERVER_TOKEN`). On an untrusted network, don't
+  start the dashboard or use `--host 127.0.0.1`.
 - The LLM key only leaves the phone to the endpoint you configure.
 - `--data DIR` moves the sandbox anywhere you like.
 
@@ -148,4 +169,5 @@ MServer/
 ```sh
 python3 tests/test_vos.py
 python3 tests/test_tools.py
+python3 tests/test_web.py
 ```

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 
 from . import llm
 from .tools import build_tools, fmt_shell
@@ -49,6 +50,7 @@ class Agent:
             vos, shell,
             {"on_present": on_present, "dashboard": self._dashboard_hook},
         )
+        self._lock = threading.Lock()  # serializes REPL + web-chat turns
         self.messages = [{"role": "system", "content": self._system_prompt()}]
 
     # -------------------------------------------------------------- wiring
@@ -80,49 +82,59 @@ Ground rules:
 - Be direct, technical and brief. No filler."""
 
     # ----------------------------------------------------------------- ask
-    def ask(self, text: str) -> str:
-        if self.local:
-            return self._local(text)
-        self.messages.append({"role": "user", "content": text})
-        for _ in range(MAX_STEPS):
-            try:
-                resp = llm.chat(self.messages, self.schemas, self.cfg)
-            except llm.LLMError as e:
-                self.messages.append({"role": "assistant", "content": "LLM call failed."})
-                return (
-                    f"⚠ LLM error: {e}\n\n"
-                    f"Falling back to offline answers. Set MOPENAI_API_KEY "
-                    f"(any OpenAI-compatible endpoint) for full AI mode."
-                )
-            calls = resp["tool_calls"]
-            if not calls:
-                content = (resp["content"] or "").strip() or "(empty reply)"
-                self.messages.append({"role": "assistant", "content": content})
-                return content
-            self.messages.append({
-                "role": "assistant",
-                "content": resp["content"],
-                "tool_calls": [
-                    {"id": c["id"], "type": "function",
-                     "function": {"name": c["name"], "arguments": c["arguments_raw"]}}
-                    for c in calls
-                ],
-            })
-            for c in calls:
-                args = self._parse_args(c["arguments_raw"])
-                self.ui.tool_trace(c["name"], args)
-                fn = self.executors.get(c["name"])
-                if fn is None:
-                    result = f"error: unknown tool {c['name']}"
-                else:
-                    try:
-                        result = fn(args)
-                    except Exception as e:
-                        result = f"error: {e}"
-                self.messages.append(
-                    {"role": "tool", "tool_call_id": c["id"], "content": str(result)}
-                )
-        return "(stopped: reached the tool-call limit — say 'continue' to go on)"
+    def ask(self, text: str, events: list | None = None) -> str:
+        """One agent turn. `events` (optional list) receives the tool calls
+        made during this turn — used by the web chat to render progress."""
+        with self._lock:
+            if events is None:
+                events = []
+            if self.local:
+                return self._local(text, events)
+            self.messages.append({"role": "user", "content": text})
+            for _ in range(MAX_STEPS):
+                try:
+                    resp = llm.chat(self.messages, self.schemas, self.cfg)
+                except llm.LLMError as e:
+                    self.messages.append({"role": "assistant", "content": "LLM call failed."})
+                    return (
+                        f"⚠ LLM error: {e}\n\n"
+                        f"Falling back to offline answers. Set MOPENAI_API_KEY "
+                        f"(any OpenAI-compatible endpoint) for full AI mode."
+                    )
+                calls = resp["tool_calls"]
+                if not calls:
+                    content = (resp["content"] or "").strip() or "(empty reply)"
+                    self.messages.append({"role": "assistant", "content": content})
+                    return content
+                self.messages.append({
+                    "role": "assistant",
+                    "content": resp["content"],
+                    "tool_calls": [
+                        {"id": c["id"], "type": "function",
+                         "function": {"name": c["name"], "arguments": c["arguments_raw"]}}
+                        for c in calls
+                    ],
+                })
+                for c in calls:
+                    args = self._parse_args(c["arguments_raw"])
+                    self.ui.tool_trace(c["name"], args)
+                    events.append({
+                        "name": c["name"],
+                        "args": {k: (str(v)[:200] + "…" if len(str(v)) > 200 else str(v))
+                                 for k, v in args.items()},
+                    })
+                    fn = self.executors.get(c["name"])
+                    if fn is None:
+                        result = f"error: unknown tool {c['name']}"
+                    else:
+                        try:
+                            result = fn(args)
+                        except Exception as e:
+                            result = f"error: {e}"
+                    self.messages.append(
+                        {"role": "tool", "tool_call_id": c["id"], "content": str(result)}
+                    )
+            return "(stopped: reached the tool-call limit — say 'continue' to go on)"
 
     def _parse_args(self, raw: str) -> dict:
         try:
@@ -132,42 +144,42 @@ Ground rules:
             return {}
 
     # -------------------------------------------------------- offline mode
-    def _local(self, text: str) -> str:
+    def _local(self, text: str, events: list | None = None) -> str:
+        events = events if events is not None else []
+
+        def run(cmd: str) -> str:
+            out, err, code = self.shell.run(cmd)
+            events.append({"name": cmd.split()[0], "args": {"command": cmd}})
+            return fmt_shell(cmd, out, err, code)
+
         t = text.strip()
         low = t.lower()
         first = low.split()[0] if low.split() else ""
         if first in self.shell.commands:
-            out, err, code = self.shell.run(t)
-            return fmt_shell(t, out, err, code)
+            return run(t)
         m = re.match(r"install\s+([a-z0-9._-]+)", low)
         if m:
-            out, err, code = self.shell.run(f"pkg install {m.group(1)}")
-            return fmt_shell(f"pkg install {m.group(1)}", out, err, code)
+            return run(f"pkg install {m.group(1)}")
         m = re.match(r"(?:remove|uninstall)\s+([a-z0-9._-]+)", low)
         if m:
-            out, err, code = self.shell.run(f"pkg remove {m.group(1)}")
-            return fmt_shell(f"pkg remove {m.group(1)}", out, err, code)
+            return run(f"pkg remove {m.group(1)}")
         m = re.match(r"(?:show|read|open|cat)\s+(/\S+)", low)
         if m:
-            out, err, code = self.shell.run(f"cat {m.group(1)}")
-            return fmt_shell(f"cat {m.group(1)}", out, err, code)
+            return run(f"cat {m.group(1)}")
         if low in ("status", "system status", "system report", "report"):
-            up, _, _ = self.shell.run("uptime")
-            ps, _, _ = self.shell.run("ps")
-            df, _, _ = self.shell.run("df")
-            pk, _, _ = self.shell.run("pkg list")
+            up = run("uptime")
+            ps = run("ps")
+            df = run("df")
+            pk = run("pkg list")
             return f"{up}\n\n{ps}\n\n{df}\n\n{pk}"
         if low in ("neofetch", "about", "who are you"):
-            out, _, _ = self.shell.run("neofetch")
-            return out
+            return run("neofetch")
         if low in ("list files", "list", "ls"):
-            out, _, _ = self.shell.run("ls -la /")
-            return out
+            return run("ls -la /")
         if low in ("help", "what can you do"):
             return _LOCAL_HELP
         if low in ("reboot", "restart the os"):
-            out, _, _ = self.shell.run("reboot")
-            return out
+            return run("reboot")
         return (
             f"Offline mode (no LLM API key), so I only run direct vOS commands.\n"
             f'I couldn\'t map "{t}" to one.\n\n'
