@@ -177,7 +177,9 @@ MServer/
 │   │   ├── risk.py        # tool risk tiers + confirmation gate
 │   │   ├── llm.py         # OpenAI-compatible client (stdlib urllib)
 │   │   └── ui.py          # ANSI panels, banner, tool trace
-│   └── web/server.py      # dashboard (http.server, thread)
+│   └── web/
+│       ├── events.py      # SSE pub/sub bus for live dashboard updates
+│       └── server.py      # dashboard, web terminal, /api/status
 └── tests/                 # dependency-free tests
 ```
 
@@ -552,6 +554,52 @@ genuinely unreadable would leave a phone owner unable to clean up their own
 data, and would silently break on Android sdcard mounts where modes barely
 exist.
 
+
+## The dashboard is live
+
+`--web` starts a dashboard on port 8686. It used to be a static page that
+reloaded itself every five seconds; now it streams.
+
+| Route | What it is |
+|---|---|
+| `/` | status page, updated live over Server-Sent Events |
+| `/term?token=…` | **web terminal** — a real msh prompt in the browser |
+| `/chat?token=…` | chat with the agent, with tool calls streaming in |
+| `/events` | the raw SSE stream |
+| `/api/status` | JSON snapshot: processes, services, listeners, packages |
+
+The **web terminal** is the useful part on a phone: type `ls -la /`, watch
+`service nginx start` come up, tail a log — from a laptop browser on the same
+Wi-Fi, without touching the Termux window. It shares the REPL's shell, so
+`cd` and exported variables carry across between the two.
+
+### It is not a shell on your phone
+
+The web terminal runs commands through the same `msh` interpreter as
+everything else, which means the sandbox, the permission layer and the
+confirmation gate all still apply:
+
+```
+$ cat ../../../../etc/passwd
+  cat: path escapes the virtual OS: /../../../../etc/passwd
+```
+
+There is no host command execution path in the web server at all — a test
+asserts `subprocess`, `os.system`, `os.popen`, `eval(` and `exec(` appear
+nowhere in it. Both `/term` and `/chat` are token-gated with a constant-time
+comparison, failures are written to `/var/log/auth.log`, and the terminal has
+its own rate-limit budget (typing 30 commands a minute is normal; 30 agent
+turns is not).
+
+### Streaming notes
+
+Server-Sent Events rather than WebSockets: the traffic is one-directional,
+SSE is plain HTTP with automatic reconnection and no dependency, and it
+survives the kind of proxy a phone sits behind. Each subscriber gets a
+bounded queue — a backgrounded phone tab stops reading, and an unbounded
+queue would quietly eat memory on a device with no swap — so a slow client
+drops its oldest events rather than the newest.
+
 ## Audit log
 
 Every tool call is appended to `/var/log/agent.log` **inside the vOS**, so you
@@ -599,6 +647,7 @@ python3 tests/test_userpkg.py
 python3 tests/test_network.py
 python3 tests/test_scheduler.py
 python3 tests/test_users.py
+python3 tests/test_dashboard.py
 ```
 
 Or all at once, if you have pytest:

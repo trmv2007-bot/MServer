@@ -225,9 +225,16 @@ for the commands that have real flags.
 - Self-reflection: the agent reads `/var/log` to debug its own failures.
 
 ### Dashboard
-SSE streaming of tool calls, web terminal, file browser/editor, live log
-viewer, service start/stop buttons, snapshot UI, `/api/status` JSON,
-artifact rendering as HTML, mobile layout pass.
+~~SSE streaming of tool calls, web terminal, `/api/status` JSON~~ — ✅ done
+(`web/events.py`, new routes in `web/server.py`). The status page no longer
+meta-refreshes; `/events` streams shell activity, tool calls and chat turns;
+`/term` is a real msh prompt in the browser sharing the REPL's shell.
+Bounded per-subscriber queues and a subscriber cap so a backgrounded phone
+tab cannot grow memory. No host execution path exists in the web server —
+asserted by a test.
+
+Still open: file browser/editor, live log viewer, service start/stop buttons,
+snapshot UI, artifact rendering as HTML, mobile layout pass.
 
 ---
 
@@ -255,8 +262,12 @@ artifact rendering as HTML, mobile layout pass.
 7. ~~**Virtual network**~~ — done, 69 new tests.
 8. ~~**`cron`/`at`**~~ — done, 85 new tests.
 9. ~~**Users + permissions**~~ — done, 83 new tests.
-10. Next: dashboard SSE + web terminal (the dashboard is still read-only and
-    static), then signals/quotas, then the Tier 3 curses TUI.
+10. ~~**Dashboard SSE + web terminal**~~ — done, 44 new tests.
+11. Next: the housekeeping that keeps being deferred — activate CI (needs a
+    human `git mv`), then `SECURITY.md`, which is now well overdue: the
+    threat model spans sandbox, gate, permissions, network egress, unattended
+    scheduled execution and a browser-facing terminal. After that: signals
+    and disk quotas, then the Tier 3 curses TUI.
 
 Open follow-ups from users: no passwords, so `su` to a *lower* privilege is
 free and `sudo` is a deliberate-intent marker rather than authentication; no

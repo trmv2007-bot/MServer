@@ -1,14 +1,18 @@
 """Web dashboard for MServerOS (stdlib http.server, runs in a thread).
 
-Two surfaces:
-  /      — read-only status page (auto-refresh)
-  /chat  — chat box that talks to the same agent (token-gated)
+Surfaces:
+  /         — status page, updated live over SSE
+  /chat     — chat box that talks to the same agent (token-gated)
+  /term     — web terminal: a real msh prompt in the browser (token-gated)
+  /events   — Server-Sent Events stream of tool calls and shell activity
+  /api/status — JSON snapshot of the same data the status page shows
 """
 from __future__ import annotations
 
 import hmac
 import html
 import json
+import queue as _queue
 import secrets
 import threading
 import time
@@ -16,6 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from ..vos import packages as pkgmod
 from ..vos.kernel import OS_NAME, OS_VERSION, SHELL_VERSION
+from . import events as events_mod
+from .events import EventBus, LiveEvents, sse_format
 
 
 class RateLimiter:
@@ -79,7 +85,6 @@ class RateLimiter:
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="5">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MServerOS dashboard</title>
 <style>
@@ -103,16 +108,55 @@ PAGE = """<!doctype html>
  <div class="card"><h2>Agent</h2>
   <table>
    <tr><td class="big"><a href="/chat">talk to the agent →</a></td></tr>
-   <tr><th>Session</th><td class="dim">chat is token-gated (token is printed in the terminal)</td></tr>
+   <tr><td class="big"><a href="/term">open the web terminal →</a></td></tr>
+   <tr><th>Session</th><td class="dim">chat and terminal are token-gated (token is printed in the terminal)</td></tr>
+   <tr><th>Live</th><td class="dim"><span id="live">connecting…</span></td></tr>
   </table>
  </div>
  <div class="card"><h2>System</h2><table>{sys_rows}</table></div>
  <div class="card"><h2>Processes</h2><table>{ps_rows}</table></div>
  <div class="card"><h2>Storage</h2><table>{disk_rows}</table></div>
  <div class="card"><h2>Packages</h2><table>{pkg_rows}</table></div>
+ <div class="card"><h2>Live activity</h2><pre id="feed" class="dim">waiting for events…</pre></div>
  <div class="card"><h2>Recent commands</h2><pre>{recent}</pre></div>
  <div class="card"><h2>Artifacts ({n_art})</h2><table>{art_rows}</table></div>
-</div></body></html>"""
+</div>
+<script>
+// Live updates over SSE. The page used to reload itself every 5 seconds,
+// which threw away scroll position and re-rendered everything to change one
+// number. Now only the parts that change are touched.
+(function(){{
+  var feed=document.getElementById('feed'), live=document.getElementById('live');
+  var lines=[];
+  function esc(s){{var d=document.createElement('div');d.textContent=s;return d.innerHTML;}}
+  function push(t){{
+    lines.push(t); if(lines.length>14) lines.shift();
+    feed.innerHTML=lines.join('\\n'); feed.className='';
+  }}
+  try{{
+    var es=new EventSource('/events');
+    es.addEventListener('hello',function(){{live.textContent='streaming';live.className='ok';}});
+    es.addEventListener('shell',function(e){{
+      var d=JSON.parse(e.data); push('$ '+esc(d.command||''));}});
+    es.addEventListener('shell-result',function(e){{
+      var d=JSON.parse(e.data);
+      if(d.code) push('  [exit '+d.code+']');}});
+    es.addEventListener('tool',function(e){{
+      var d=JSON.parse(e.data); push('\\u2699 '+esc(d.name||'tool'));}});
+    es.addEventListener('chat',function(e){{
+      var d=JSON.parse(e.data);
+      push((d.role==='user'?'\\u203a ':'\\u2190 ')+esc((d.message||'').slice(0,120)));}});
+    es.onerror=function(){{live.textContent='reconnecting…';live.className='dim';}};
+  }}catch(err){{live.textContent='no SSE support';}}
+  // Numbers still need refreshing; poll the JSON rather than the whole page.
+  setInterval(function(){{
+    fetch('/api/status').then(function(r){{return r.json();}}).then(function(j){{
+      document.title=j.hostname+' · '+j.uptime;
+    }}).catch(function(){{}});
+  }}, 10000);
+}})();
+</script>
+</body></html>"""
 
 CHAT_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8">
@@ -198,6 +242,89 @@ msg.focus();
 </body></html>"""
 
 
+TERM_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MServerOS — terminal</title>
+<style>
+ :root{color-scheme:dark}
+ *{box-sizing:border-box}
+ body{margin:0;background:#0b0f14;color:#c9d1d9;
+      font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+ header{padding:10px 14px;border-bottom:1px solid #1d2530;
+        display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+ h1{font-size:14px;margin:0;color:#7ee787}
+ .dim{color:#6b7684}
+ .pill{border:1px solid #1d2530;border-radius:99px;padding:1px 9px;font-size:12px}
+ #log{padding:12px 14px;white-space:pre-wrap;word-break:break-word;
+      min-height:60vh}
+ .cmd{color:#7ee787}
+ .err{color:#ff7b72}
+ .code{color:#d29922}
+ form{position:sticky;bottom:0;background:#0b0f14;border-top:1px solid #1d2530;
+      display:flex;gap:8px;padding:10px 14px}
+ #ps1{color:#7ee787;white-space:nowrap}
+ input{flex:1;background:#0d1117;border:1px solid #1d2530;border-radius:6px;
+       color:#c9d1d9;padding:8px 10px;font:inherit}
+ button{background:#238636;border:0;border-radius:6px;color:#fff;
+        padding:8px 14px;font:inherit;cursor:pointer}
+ a{color:#58a6ff}
+</style></head><body>
+<header>
+  <h1>msh — web terminal</h1>
+  <span class="pill dim">__MODE__</span>
+  <span class="pill dim" id="who">root</span>
+  <span class="dim" style="margin-left:auto">
+    <a href="/">status</a> · <a href="/chat">chat</a>
+  </span>
+</header>
+<div id="log"><span class="dim">Type a command. This is the virtual OS \u2014 \
+the sandbox, permissions and the confirmation gate all still apply.
+It is not a shell on the phone itself.</span>\n\n</div>
+<form id="f">
+  <span id="ps1">/ $</span>
+  <input id="i" autocomplete="off" autocapitalize="off" autocorrect="off"
+         spellcheck="false" placeholder="ls -la /">
+  <button>run</button>
+</form>
+<script>
+const log=document.getElementById('log'), inp=document.getElementById('i');
+const ps1=document.getElementById('ps1'), who=document.getElementById('who');
+const token=new URLSearchParams(location.search).get('token')||'';
+const hist=[]; let hp=0;
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function add(html){log.insertAdjacentHTML('beforeend',html);
+                   window.scrollTo(0,document.body.scrollHeight);}
+inp.addEventListener('keydown',e=>{
+  if(e.key==='ArrowUp'){if(hp>0){hp--;inp.value=hist[hp]||'';}e.preventDefault();}
+  if(e.key==='ArrowDown'){if(hp<hist.length-1){hp++;inp.value=hist[hp]||'';}
+                          else{hp=hist.length;inp.value='';}e.preventDefault();}
+});
+document.getElementById('f').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const cmd=inp.value.trim(); if(!cmd) return;
+  hist.push(cmd); hp=hist.length; inp.value='';
+  add('<span class="cmd">'+esc(ps1.textContent+' '+cmd)+'</span>\n');
+  if(cmd==='clear'){log.innerHTML='';return;}
+  try{
+    const r=await fetch('/term',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token,command:cmd})});
+    const j=await r.json();
+    if(!j.ok){add('<span class="err">'+esc(j.error||'error')+'</span>\n');}
+    else{
+      if(j.out) add(esc(j.out)+'\n');
+      if(j.err) add('<span class="err">'+esc(j.err)+'</span>\n');
+      if(j.code) add('<span class="code">[exit '+j.code+']</span>\n');
+      ps1.textContent=(j.cwd||'/')+' $'; who.textContent=j.user||'root';
+    }
+  }catch(err){add('<span class="err">network error</span>\n');}
+  add('\n');
+});
+inp.focus();
+</script></body></html>"""
+
+
 def _rows(pairs):
     return "".join(f"<tr><th>{html.escape(k)}</th><td>{v}</td></tr>" for k, v in pairs)
 
@@ -213,6 +340,10 @@ class Dashboard:
         self.agent = agent
         self.token = token or secrets.token_urlsafe(8)
         self.limiter = RateLimiter()
+        # A separate, roomier budget for the terminal: typing 20 commands in
+        # a minute is normal use, whereas 20 chat turns is not.
+        self.term_limiter = RateLimiter(max_requests=60, window=60.0)
+        self.bus = EventBus()
         self.mode_label = "…"
         self._server = None
         self._thread = None
@@ -248,10 +379,55 @@ class Dashboard:
             def _json(self, code, obj):
                 self._send(code, "application/json", json.dumps(obj).encode("utf-8"))
 
+            def _authed(self):
+                """Token from the query string, for GET endpoints."""
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query)
+                given = (q.get("token") or [""])[0]
+                return hmac.compare_digest(str(given), dash.token)
+
+            def _sse(self):
+                """Stream events until the client goes away."""
+                q = dash.bus.subscribe()
+                if q is None:
+                    self._json(503, {"ok": False, "error": "too many streams"})
+                    return
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    # Without this, a proxy may buffer the stream forever.
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    self.wfile.write(sse_format(
+                        {"seq": 0, "kind": "hello",
+                         "data": {"message": "connected"}}))
+                    self.wfile.flush()
+                    while True:
+                        try:
+                            ev = q.get(timeout=events_mod.HEARTBEAT_SECONDS)
+                            self.wfile.write(sse_format(ev))
+                        except _queue.Empty:
+                            self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass          # the tab was closed; entirely normal
+                finally:
+                    dash.bus.unsubscribe(q)
+
             def do_GET(self):
-                if self.path in ("/", "/index.html"):
+                route = self.path.split("?")[0]
+                if route in ("/", "/index.html"):
                     self._send(200, "text/html; charset=utf-8", dash.page().encode("utf-8"))
-                elif self.path.split("?")[0] == "/chat":
+                elif route == "/events":
+                    self._sse()
+                elif route == "/api/status":
+                    self._json(200, dash.status())
+                elif route == "/term":
+                    page = TERM_PAGE.replace("__MODE__", html.escape(dash.mode_label))
+                    self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
+                elif route == "/chat":
                     page = CHAT_PAGE.replace("__MODE__", html.escape(dash.mode_label))
                     self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
                 elif self.path.startswith("/a/"):
@@ -265,8 +441,51 @@ class Dashboard:
                 else:
                     self._send(404, "text/plain", b"not found")
 
+            def _do_term(self):
+                """Run one shell command typed into the web terminal.
+
+                This is the same msh the REPL uses, so the sandbox, the
+                permission layer and the confirmation gate all still apply.
+                It is NOT a shell on the host: there is no host command
+                execution path anywhere in this handler.
+                """
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                except (ValueError, OSError):
+                    self._json(400, {"ok": False, "error": "bad JSON body"})
+                    return
+                client = self.client_address[0] if self.client_address else "?"
+                allowed, retry_in = dash.term_limiter.check(client)
+                if not allowed:
+                    self._json(429, {"ok": False,
+                                     "error": f"too many commands — wait {retry_in}s"})
+                    return
+                if not isinstance(body, dict) or not hmac.compare_digest(
+                        str(body.get("token", "")), dash.token):
+                    dash.term_limiter.fail(client)
+                    dash.log_auth(f"failed terminal auth from {client}")
+                    self._json(401, {"ok": False, "error": "bad token"})
+                    return
+                command = str(body.get("command", "")).strip()
+                if not command:
+                    self._json(400, {"ok": False, "error": "empty command"})
+                    return
+                try:
+                    out, err, code = dash.run_command(command, client)
+                except Exception as e:
+                    self._json(500, {"ok": False, "error": f"shell error: {e}"})
+                    return
+                self._json(200, {"ok": True, "out": out, "err": err,
+                                 "code": code, "cwd": dash.shell.cwd,
+                                 "user": dash.vos.users.current})
+
             def do_POST(self):
-                if self.path.split("?")[0] != "/chat":
+                route = self.path.split("?")[0]
+                if route == "/term":
+                    self._do_term()
+                    return
+                if route != "/chat":
                     self._send(404, "text/plain", b"not found")
                     return
                 try:
@@ -296,10 +515,14 @@ class Dashboard:
                 if dash.agent is None:
                     self._json(503, {"ok": False, "error": "agent not attached"})
                     return
-                events: list[dict] = []
+                events = LiveEvents(dash.bus)
+                dash.bus.publish("chat", {"role": "user", "message": message})
                 try:
                     reply = dash.agent.ask(message, events=events)
-                    self._json(200, {"ok": True, "reply": reply, "events": events})
+                    dash.bus.publish("chat", {"role": "assistant",
+                                              "message": reply[:2000]})
+                    self._json(200, {"ok": True, "reply": reply,
+                                     "events": list(events)})
                 except Exception as e:  # never kill the server over one turn
                     self._json(500, {"ok": False, "error": f"agent error: {e}"})
 
@@ -313,6 +536,59 @@ class Dashboard:
             self._server.server_close()
             self._server = None
             self._thread = None
+
+    def status(self) -> dict:
+        """JSON snapshot — the same data the status page renders."""
+        vos, shell = self.vos, self.shell
+        used, files = vos.disk_usage()
+        try:
+            listeners = vos.network.listeners()
+        except Exception:
+            listeners = []
+        return {
+            "os": f"{OS_NAME} {OS_VERSION}",
+            "hostname": vos.hostname,
+            "uptime": vos.uptime_str(),
+            "mode": self.mode_label,
+            "user": vos.users.current,
+            "disk": {"used_bytes": used, "files": files},
+            "processes": [
+                {"pid": p["pid"], "cmdline": p["cmdline"],
+                 "seconds": int(time.time() - p["started"])}
+                for p in (vos.processes[k] for k in sorted(vos.processes))
+            ],
+            "services": {n: vos.service_state(n) or "stopped"
+                         for n in sorted(vos.services)},
+            "listeners": listeners,
+            "packages": sorted(vos.installed_packages()),
+            "recent": [{"at": ts, "command": cmd}
+                       for ts, cmd, _h in shell.recent[-12:]],
+            "streams": self.bus.subscriber_count(),
+        }
+
+    def run_command(self, command: str, client: str = "web") -> tuple:
+        """Run one command from the web terminal, and stream it to watchers.
+
+        Uses the same Shell as the REPL on purpose: the point of the web
+        terminal is to drive *this* session, so cd and exported variables
+        must carry across. Turns are serialised by the agent lock where an
+        agent exists, so a command cannot interleave with an agent turn.
+        """
+        lock = getattr(self.agent, "_lock", None)
+        self.bus.publish("shell", {"command": command, "client": client})
+        if lock is not None:
+            with lock:
+                out, err, code = self.shell.run(command)
+        else:
+            out, err, code = self.shell.run(command)
+        self.bus.publish("shell-result", {
+            "command": command, "code": code,
+            "out": (out or "")[:2000], "err": (err or "")[:2000]})
+        try:
+            self.vos.syslog.write("mserver-web", f"{client}: {command}")
+        except Exception:
+            pass
+        return out, err, code
 
     def log_auth(self, message: str) -> None:
         """Record an authentication event in the vOS auth log."""
