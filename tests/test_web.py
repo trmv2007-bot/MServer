@@ -8,10 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mserver.vos.kernel import VOS  # noqa: E402
-from mserver.vos.shell import Shell  # noqa: E402
 from mserver.agent.core import Agent  # noqa: E402
 from mserver.agent.ui import UI  # noqa: E402
+from mserver.vos.kernel import VOS  # noqa: E402
+from mserver.vos.shell import Shell  # noqa: E402
 from mserver.web.server import Dashboard  # noqa: E402
 
 TOKEN = "test-token-123"

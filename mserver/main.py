@@ -27,6 +27,19 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--local", action="store_true", help="force offline mode (ignore API key)")
     ap.add_argument("--web", action="store_true", help="start the web dashboard alongside the REPL")
     ap.add_argument("--web-only", action="store_true", help="only run the dashboard (no REPL)")
+    ap.add_argument("--version", action="version",
+                    version=f"mserver {__version__}",
+                    help="print the version and exit")
+    ap.add_argument("--as-user", metavar="NAME", default=None,
+                    help="run the agent as a non-root vOS user (e.g. --as-user "
+                         "agent), so it cannot write to /etc even if it tries")
+    ap.add_argument("--net", action="store_true",
+                    help="allow the agent to download from the public internet "
+                         "(off by default; fetched pages are untrusted input)")
+    ap.add_argument("--yolo", action="store_true",
+                    help="never ask before destructive actions (scripted runs)")
+    ap.add_argument("--safe", action="store_true",
+                    help="refuse all destructive actions outright")
     return ap
 
 
@@ -39,9 +52,34 @@ def main(argv=None) -> int:
     vos = VOS(data / "vos")
     shell = Shell(vos)
     ui = UI()
-    agent = Agent(vos, shell, ui, artifacts_dir, force_local=args.local)
+
+    def confirm(prompt: str) -> bool:
+        """Ask on the terminal before a destructive tool call."""
+        try:
+            return input(ui.yellow(prompt)).strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+
+    if args.net:
+        os.environ["MSERVER_NET"] = "1"
+    if args.as_user:
+        try:
+            vos.users.su(args.as_user)
+            ui.println(ui.dim(
+                f"  running as '{args.as_user}' — permissions are enforced; "
+                f"use sudo for root-only work"))
+        except Exception as e:
+            ui.println(ui.dim(f"  --as-user failed: {e}"))
+            return 1
+    gate_mode = "allow" if args.yolo else ("deny" if args.safe else "ask")
+    agent = Agent(vos, shell, ui, artifacts_dir, force_local=args.local,
+                  gate_mode=gate_mode,
+                  confirm=None if args.web_only else confirm,
+                  data_dir=data)
     dash = Dashboard(vos, shell, artifacts_dir, port=args.port, host=args.host,
-                     agent=agent, token=os.environ.get("MSERVER_TOKEN") or None)
+                     agent=agent, token=os.environ.get("MSERVER_TOKEN") or None,
+                     data_dir=data)
     agent.set_dashboard(dash)
     dash.mode_label = (
         f"AI · {agent.cfg.model}" if not agent.local else "offline · local mode"
@@ -105,6 +143,8 @@ def main(argv=None) -> int:
 
     if dash.running:
         dash.stop()
+    shell.save_history()
+    vos.scheduler.stop()   # don't leave crond ticking after the REPL exits
     ui.println(ui.dim(f"\n  {OS_NAME} halted. goodbye."))
     return 0
 
@@ -122,7 +162,7 @@ def _slash(line: str, agent: Agent, dash: Dashboard, ui: UI) -> bool:
             "/status           system report",
             "/web on|off       start/stop the dashboard",
             "/artifacts        list presented artifacts",
-            "/key              LLM configuration (key stays hidden)",
+            "/key [sk-...]     show or set the API key, model and endpoint",
             "/about            about MServerOS",
             "/clear            clear the terminal",
             "/exit             halt MServerOS",
@@ -162,13 +202,49 @@ def _slash(line: str, agent: Agent, dash: Dashboard, ui: UI) -> bool:
             )
         return False
     if cmd == "/key":
+        from .agent import settings as settingsmod
+        # `/key <value>` sets it; bare `/key` reports. Previously this could
+        # only report, so realising you had forgotten the key meant quitting.
+        if len(parts) > 1:
+            arg = line.split(None, 1)[1].strip()
+            try:
+                if arg in ("clear", "unset", "remove"):
+                    settingsmod.save(agent.data_dir, {"api_key": None})
+                    agent.reload_config()
+                    ui.println(ui.yellow("  API key cleared — offline mode."))
+                    return False
+                values = settingsmod.validate({"api_key": arg})
+                settingsmod.save(agent.data_dir, values)
+            except settingsmod.SettingsError as e:
+                ui.println(ui.red(f"  {e}"))
+                return False
+            except Exception as e:
+                ui.println(ui.red(f"  could not save: {e}"))
+                return False
+            online = agent.reload_config()
+            if dash is not None:
+                dash.mode_label = (f"AI · {agent.cfg.model}" if online
+                                   else "offline · local mode")
+            ui.println(ui.green(
+                f"  API key saved to {settingsmod.config_path(agent.data_dir)} "
+                f"(chmod 600)."))
+            ui.println(ui.green(f"  Agent is online with {agent.cfg.model}.")
+                       if online else
+                       ui.yellow("  Still offline — check the key."))
+            return False
         cfg = agent.cfg
         if cfg.has_key:
-            ui.println(ui.green(f"  API key: set ({cfg.api_key[:4]}…{cfg.api_key[-4:]})"))
+            ui.println(ui.green(f"  API key: set ({settingsmod.mask(cfg.api_key)})"))
         else:
             ui.println(ui.yellow("  API key: not set (offline mode)"))
         ui.println(ui.dim(f"  model: {cfg.model}"))
         ui.println(ui.dim(f"  endpoint: {cfg.base_url}"))
+        env = settingsmod.env_overrides()
+        if env:
+            ui.println(ui.dim("  from environment: " + ", ".join(
+                f"{k} ({v})" for k, v in sorted(env.items()))))
+        ui.println(ui.dim("  set with:  /key sk-...   ·   or the dashboard "
+                          "settings page"))
         return False
     if cmd == "/about":
         ui.panel("ABOUT",

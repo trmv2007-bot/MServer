@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests · python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor: MServer uses PEP 604 union syntax.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -v
+
+      - name: Run suites standalone
+        # Each suite must also work as a bare script, the way the README
+        # documents it for Termux users with no pytest installed.
+        run: |
+          python tests/test_vos.py
+          python tests/test_tools.py
+          python tests/test_web.py
+          python tests/test_context.py
+          python tests/test_safety.py
+          python tests/test_shell2.py
+          python tests/test_procfs.py
+          python tests/test_userpkg.py
+          python tests/test_network.py
+          python tests/test_scheduler.py
+          python tests/test_users.py
+          python tests/test_dashboard.py
+          python tests/test_settings.py
+
+      - name: Smoke test the REPL
+        run: |
+          printf '!pkg install nginx\n!service nginx start\n!ps\nstatus\n/exit\n' \
+            | python -m mserver --local --data "$RUNNER_TEMP/mserver-ci"
+
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  package:
+    name: build + install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - name: Install the wheel and check the console script
+        run: |
+          pip install dist/*.whl
+          mserver --help

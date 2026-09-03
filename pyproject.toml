@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mserver"
+version = "1.0.0"
+description = "An AI agent with its own virtual Linux OS, built to run on Termux (Android)."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["ai", "agent", "termux", "android", "virtual-os", "sandbox", "cli"]
+authors = [{ name = "trmv2007-bot" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Android",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Emulators",
+    "Topic :: System :: Shells",
+]
+
+# No runtime dependencies, deliberately: MServer is pure Python 3 stdlib so it
+# installs on Termux from `pkg install python` alone, with no compiler and no
+# wheels to build.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/trmv2007-bot/MServer"
+Repository = "https://github.com/trmv2007-bot/MServer"
+Issues = "https://github.com/trmv2007-bot/MServer/issues"
+
+[project.scripts]
+mserver = "mserver.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mserver"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # long lines are mostly ASCII art and embedded HTML
+    "E741",  # `l` for "line" is idiomatic throughout the shell internals
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests and the entrypoint import after a sys.path / version-guard prelude.
+"tests/*" = ["E402"]
+"mserver/__main__.py" = ["E402"]
