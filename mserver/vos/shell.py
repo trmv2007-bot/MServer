@@ -16,12 +16,14 @@ from . import packages as pkgmod
 from . import scheduler as cronmod
 from . import snapshots as snapmod
 from . import userpkg
+from . import users as usermod
 from .kernel import (
     OS_NAME,
     OS_VERSION,
     SHELL_NAME,
     SHELL_VERSION,
     VOS,
+    PermissionDenied,
     VOSFsError,
     VOSPathError,
 )
@@ -152,6 +154,12 @@ class Shell:
             "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
         }
 
+        # main.py may have switched user before the shell was created.
+        _cur = vos.users.get_user(vos.users.current)
+        if _cur:
+            self.env["USER"] = self.env["LOGNAME"] = _cur["name"]
+            self.env["HOME"] = _cur["home"]
+
         registry = pkgmod.full_registry(vos)
         for name in vos.installed_packages():
             pkg = registry.get(name)
@@ -173,6 +181,10 @@ class Shell:
             "neofetch": S.cmd_neofetch, "history": S.cmd_history,
             "which": S.cmd_which, "free": S.cmd_free, "df": S.cmd_df,
             "pkg": S.cmd_pkg, "service": S.cmd_service,
+            "id": S.cmd_id, "users": S.cmd_users,
+            "useradd": S.cmd_useradd, "userdel": S.cmd_userdel,
+            "su": S.cmd_su, "sudo": S.cmd_sudo, "logout": S.cmd_exit_user,
+            "chmod": S.cmd_chmod, "chown": S.cmd_chown,
             "crontab": S.cmd_crontab, "at": S.cmd_at,
             "ping": S.cmd_ping, "ifconfig": S.cmd_ifconfig,
             "ip": S.cmd_ip, "netstat": S.cmd_netstat,
@@ -223,6 +235,15 @@ class Shell:
             "df": "disk usage",
             "pkg": "package manager (pkg list|search|info|install|remove)",
             "service": "services (service [name] start|stop|status)",
+            "id": "show user and group ids (id [user])",
+            "users": "list user accounts",
+            "useradd": "create a user (useradd alice)",
+            "userdel": "delete a user (userdel alice)",
+            "su": "switch user (su agent), 'logout' to return",
+            "sudo": "run one command as root (sudo rm /etc/x)",
+            "logout": "return to the user you switched from",
+            "chmod": "change permissions (chmod 640 file | chmod u+x file)",
+            "chown": "change owner (chown agent /srv/www)",
             "crontab": "scheduled jobs (crontab -l | -a 'spec' 'cmd' | -r id | -n)",
             "at": "run a command later (at +5m 'cmd' | at -l | at -r id)",
             "ping": "ping a host on the virtual network (ping [-c n] host)",
@@ -388,7 +409,7 @@ class Shell:
                 # Feed stdout onward only when the NEXT segment is a pipe.
                 nxt = segs[idx + 1][0] if idx + 1 < len(segs) else ""
                 cur_stdin = out if nxt == "|" else None
-        except (VOSPathError, VOSFsError) as e:
+        except (VOSPathError, VOSFsError, PermissionDenied) as e:
             out, err, code = "", str(e), 1
         except Exception as e:  # keep the vOS alive no matter what
             out, err, code = "", f"msh: internal error: {e}", 1
@@ -421,6 +442,8 @@ class Shell:
             args = self._expand(args)
         try:
             out, err, code = fn(self, args, stdin)
+        except PermissionDenied as e:
+            return "", str(e), 1
         except (VOSPathError, VOSFsError) as e:
             return "", f"{name}: {e}", 1
         except Exception as e:
@@ -522,10 +545,15 @@ class Shell:
                 blocks.append("\n".join(lines))
                 continue
             lines = []
+            udb = self.vos.users
             for e in entries:
-                perm = "drwxr-xr-x" if e["isdir"] else "-rw-r--r--"
+                child = self._join(path, e["name"])
+                meta = udb.meta(child)
+                perm = usermod.mode_str(meta["mode"], e["isdir"])
+                owner = udb.name_of_uid(meta["uid"])
                 date = datetime.fromtimestamp(e["mtime"]).strftime("%Y-%m-%d %H:%M")
-                lines.append(f"{perm}  root  {e['size']:>7}  {date}  {e['name']}")
+                lines.append(
+                    f"{perm}  {owner:<6}{e['size']:>7}  {date}  {e['name']}")
             blocks.append("\n".join(lines) if lines else "(empty)")
         return "\n\n".join(blocks), "", 0
 
@@ -652,7 +680,7 @@ class Shell:
         return "\n".join(out) if out else "(no files)", "", 0
 
     def cmd_whoami(self, args, stdin):
-        return "root", "", 0
+        return self.vos.users.current, "", 0
 
     def cmd_hostname(self, args, stdin):
         return self.vos.hostname, "", 0
@@ -705,6 +733,146 @@ class Shell:
 
     def cmd_clear(self, args, stdin):
         return "", "", 0
+
+    # --------------------------------------------------------------- users
+    def cmd_id(self, args, stdin):
+        udb = self.vos.users
+        name = args[0] if args else udb.current
+        u = udb.get_user(name)
+        if not u:
+            return "", f"id: '{name}': no such user", 1
+        return (f"uid={u['uid']}({u['name']}) gid={u['gid']}({u['name']})"
+                f" groups={u['gid']}({u['name']})"), "", 0
+
+    def cmd_users(self, args, stdin):
+        udb = self.vos.users
+        rows = ["  UID    USER       HOME              SHELL"]
+        for u in sorted(udb.users(), key=lambda x: x["uid"]):
+            mark = "*" if u["name"] == udb.current else " "
+            rows.append(f" {mark}{u['uid']:<6} {u['name']:<10} "
+                        f"{u['home']:<17} {u['shell']}")
+        return "\n".join(rows) + "\n  (* current user)", "", 0
+
+    def cmd_useradd(self, args, stdin):
+        if not args:
+            return "", "usage: useradd <name>", 1
+        if len(args) > 1:
+            # 'useradd with space' would otherwise silently create 'with'.
+            return "", (f"useradd: too many arguments; a user name cannot "
+                        f"contain spaces (got {' '.join(args)!r})"), 1
+        udb = self.vos.users
+        if not udb.is_root():
+            return "", "useradd: only root may add users", 1
+        try:
+            u = udb.add_user(args[0])
+        except usermod.UserError as e:
+            return "", f"useradd: {e}", 1
+        return f"created user {u['name']} (uid {u['uid']}, home {u['home']})", "", 0
+
+    def cmd_userdel(self, args, stdin):
+        if not args:
+            return "", "usage: userdel <name>", 1
+        udb = self.vos.users
+        if not udb.is_root():
+            return "", "userdel: only root may remove users", 1
+        try:
+            udb.del_user(args[0])
+        except usermod.UserError as e:
+            return "", f"userdel: {e}", 1
+        return f"deleted user {args[0]}", "", 0
+
+    def cmd_su(self, args, stdin):
+        udb = self.vos.users
+        name = args[0] if args and args[0] != "-" else (
+            args[1] if len(args) > 1 else "root")
+        try:
+            u = udb.su(name)
+        except usermod.UserError as e:
+            return "", str(e), 1
+        self.env["USER"] = self.env["LOGNAME"] = u["name"]
+        self.env["HOME"] = u["home"]
+        if not self.vos.exists(u["home"]) and udb.is_root():
+            try:
+                self.vos.mkdir(u["home"])
+            except Exception:
+                pass
+        return (f"switched to {u['name']}"
+                + ("" if udb.is_root() else
+                   " — permissions are now enforced; 'exit' to go back")), "", 0
+
+    def cmd_exit_user(self, args, stdin):
+        udb = self.vos.users
+        back = udb.exit_user()
+        if back is None:
+            return "", "exit: not in a su session (use 'exit' at the prompt to quit)", 1
+        u = udb.get_user(back) or {"name": back, "home": "/root"}
+        self.env["USER"] = self.env["LOGNAME"] = u["name"]
+        self.env["HOME"] = u.get("home", "/root")
+        return f"back to {back}", "", 0
+
+    def cmd_sudo(self, args, stdin):
+        """Run one command as root.
+
+        There are no passwords in the vOS, so this is not an authentication
+        boundary — it is a way to say 'yes, deliberately' after dropping
+        privileges. Destructive commands still go through the same gate.
+        """
+        if not args:
+            return "", "usage: sudo <command>", 1
+        udb = self.vos.users
+        was, stack = udb.current, udb.enforce
+        udb.current = "root"
+        try:
+            self.vos.syslog.auth(f"{was} : COMMAND={' '.join(args)}")
+            return self.run(" ".join(args), stdin=stdin, _record=False)
+        finally:
+            udb.current, udb.enforce = was, stack
+
+    def cmd_chmod(self, args, stdin):
+        if len(args) < 2:
+            return "", "usage: chmod <mode> <path>  (e.g. chmod 640 /etc/x)", 1
+        udb = self.vos.users
+        spec, paths = args[0], args[1:]
+        out = []
+        for path in paths:
+            full = self._join(self.cwd, path)
+            if not self.vos.exists(full):
+                out.append(f"chmod: cannot access '{path}': No such file")
+                continue
+            meta = udb.meta(full)
+            if not udb.is_root() and udb.enforce and \
+                    meta["uid"] != udb.uid_of(udb.current):
+                out.append(f"chmod: changing permissions of '{path}': Not the owner")
+                continue
+            try:
+                mode = usermod.parse_mode(spec, meta["mode"],
+                                          self.vos.is_dir(full))
+            except usermod.UserError as e:
+                return "", f"chmod: {e}", 1
+            udb.set_mode(full, mode)
+            out.append(f"mode of '{path}' changed to "
+                       f"{oct(mode)[2:]} ({usermod.mode_str(mode)})")
+        return "\n".join(out), "", 0
+
+    def cmd_chown(self, args, stdin):
+        if len(args) < 2:
+            return "", "usage: chown <user> <path>", 1
+        udb = self.vos.users
+        if not udb.is_root():
+            return "", "chown: only root may change ownership", 1
+        owner = args[0].split(":")[0]
+        u = udb.get_user(owner)
+        if not u:
+            return "", f"chown: invalid user: '{owner}'", 1
+        out = []
+        for path in args[1:]:
+            full = self._join(self.cwd, path)
+            if not self.vos.exists(full):
+                out.append(f"chown: cannot access '{path}': No such file")
+                continue
+            udb.set_owner(full, u["uid"], u["gid"])
+            out.append(f"owner of '{path}' changed to {owner}")
+        return "\n".join(out), "", 0
 
     # ---------------------------------------------------------- scheduling
     def _cron_running(self):
@@ -1214,7 +1382,7 @@ class Shell:
             return "", "source: needs a file", 1
         try:
             body = self.vos.read(args[0])
-        except (VOSPathError, VOSFsError) as e:
+        except (VOSPathError, VOSFsError, PermissionDenied) as e:
             return "", f"source: {e}", 1
         outs = []
         for raw in body.splitlines():
@@ -1384,7 +1552,7 @@ class Shell:
                 for fpath in p.files:
                     try:
                         self.vos.remove(fpath)
-                    except (VOSPathError, VOSFsError):
+                    except (VOSPathError, VOSFsError, PermissionDenied):
                         pass
                 self.vos.set_installed_packages([n for n in installed if n != name])
                 self.vos.syslog.write("vos-pkg", f"removed {name}")
@@ -1523,7 +1691,7 @@ class Shell:
             if self.vos.stop_service(name):
                 try:
                     self.vos.remove(f"/var/run/{name}.pid")
-                except (VOSPathError, VOSFsError):
+                except (VOSPathError, VOSFsError, PermissionDenied):
                     pass
                 self.vos.syslog.service(name, "stopped")
                 return f"{name} stopped", "", 0

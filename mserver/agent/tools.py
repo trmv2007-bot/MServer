@@ -242,6 +242,18 @@ def build_tools(vos, shell, hooks):
             return _clip(out or err)
         return "error: action must be list | cron | at | remove | log"
 
+    def t_whoami(a):
+        """Report the current vOS user and what it may not do."""
+        out, err, _ = shell.run("id")
+        udb = vos.users
+        extra = ""
+        if not udb.is_root():
+            extra = ("\nYou are NOT root: writes to /etc, /usr and other "
+                     "system paths will be refused. Use 'sudo <command>' "
+                     "through vos_run for work that genuinely needs root, "
+                     "and say why.")
+        return f"{out or err}\ncurrent user: {udb.current}{extra}"
+
     def t_services(a):
         out, err, _ = shell.run("ps")
         return out or err
@@ -447,6 +459,13 @@ def build_tools(vos, shell, hooks):
         ),
         _schema("services", "Show running processes/services in the vOS.", {}, []),
         _schema(
+            "whoami",
+            "Show which vOS user you are running as and whether file "
+            "permissions are being enforced. Check this if a write is "
+            "refused with 'Permission denied'.",
+            {}, [],
+        ),
+        _schema(
             "schedule",
             "Run work later or repeatedly. 'cron' repeats on a schedule "
             "(when='*/5 * * * *' or '@hourly'), 'at' runs once (when='+5m' or "
@@ -501,6 +520,7 @@ def build_tools(vos, shell, hooks):
         "pkg_created": t_pkg_created,
         "web_fetch": t_web_fetch,
         "services": t_services,
+        "whoami": t_whoami,
         "schedule": t_schedule,
         "net": t_net,
         "present": t_present,

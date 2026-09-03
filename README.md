@@ -165,6 +165,7 @@ MServer/
 │   │   ├── userpkg.py     # packages the agent writes for itself
 │   │   ├── network.py     # virtual network: DNS, ports, nginx serving
 │   │   ├── scheduler.py   # cron + at, the vOS's own background thread
+│   │   ├── users.py       # accounts, groups, mode bits, su/sudo
 │   │   ├── shell.py       # msh interpreter
 │   │   ├── snapshots.py   # filesystem snapshots / rollback
 │   │   └── packages.py    # pkg registry (cowsay, nginx, git, …)
@@ -486,6 +487,71 @@ something could write to directly.
 Jobs also run on their own `Shell` instance with cwd `/root`, so a job that
 does `cd /tmp` cannot move your working directory out from under you.
 
+
+## Users and permissions
+
+The vOS ships with `root`, `agent` and `nobody`. As root nothing is enforced,
+exactly as on a real box. Drop to another user and permissions start to bite.
+
+```
+mserver ❯ su agent
+  switched to agent — permissions are now enforced; 'exit' to go back
+
+mserver ❯ echo pwned > /etc/hosts
+  write: /etc/hosts: Permission denied (you are 'agent', not root)
+
+mserver ❯ echo fine > /tmp/scratch
+mserver ❯ sudo touch /etc/allowed
+mserver ❯ logout
+  back to root
+```
+
+| Command | What it does |
+|---|---|
+| `whoami` / `id [user]` / `users` | who you are, and who exists |
+| `su <user>` / `logout` | switch user, and switch back |
+| `sudo <command>` | run one command as root |
+| `useradd` / `userdel` | manage accounts (root only) |
+| `chmod 640 f` / `chmod u+x f` | change mode bits, octal or symbolic |
+| `chown agent /srv/www` | change owner (root only) |
+
+`ls -l` shows real modes and owners. Ownership and mode bits live in
+`/var/lib/vos/permissions.json` **inside** the rootfs, so snapshots and
+rollback cover them.
+
+### Run the agent as a non-root user
+
+```bash
+python3 -m mserver --as-user agent
+```
+
+This is the part worth caring about. The confirmation gate protects you only
+while the model cooperates; permissions do not. With `--as-user agent` the
+agent's writes to `/etc` and `/usr` are refused by the filesystem layer
+whatever the model decides to attempt. It can still do its work in `/tmp`,
+`/home/agent` and `/srv`, and can ask for `sudo` when it genuinely needs root.
+
+### Permissions are an inner layer, not the sandbox
+
+These two failures are deliberately different things:
+
+```
+write: /etc/hosts: Permission denied (you are 'agent', not root)
+cat: path escapes the virtual OS: /../../../etc/passwd
+```
+
+The first is the vOS permission layer. The second is the sandbox, and it runs
+**first** — `vpath()` resolves and validates every path before any permission
+check happens, so a bug in mode-bit arithmetic can never become a host
+filesystem escape. `sudo` raises your privilege inside the vOS and never on
+the real machine; there is a test asserting that `sudo cat ../../../etc/passwd`
+still fails.
+
+Mode bits are metadata, not real host permissions. Making the backing files
+genuinely unreadable would leave a phone owner unable to clean up their own
+data, and would silently break on Android sdcard mounts where modes barely
+exist.
+
 ## Audit log
 
 Every tool call is appended to `/var/log/agent.log` **inside the vOS**, so you
@@ -532,6 +598,7 @@ python3 tests/test_procfs.py
 python3 tests/test_userpkg.py
 python3 tests/test_network.py
 python3 tests/test_scheduler.py
+python3 tests/test_users.py
 ```
 
 Or all at once, if you have pytest:

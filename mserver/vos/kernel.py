@@ -17,6 +17,10 @@ from .procfs import ProcFS
 from .scheduler import Scheduler
 from .syslog import BOOT_SEQUENCE, SysLog
 
+# PermissionDenied is re-exported: the shell and tools import all
+# filesystem errors from kernel, and this is one of them.
+from .users import PermissionDenied, UserDB  # noqa: F401
+
 OS_NAME = "MServerOS"
 OS_VERSION = "1.0"
 SHELL_NAME = "msh"
@@ -67,6 +71,7 @@ class VOS:
         self.syslog = SysLog(self, hostname)
         self.network = Network(self)
         self.scheduler = Scheduler(self)
+        self.users = UserDB(self)
         self._boot()
 
     # ------------------------------------------------------------- booting
@@ -84,6 +89,7 @@ class VOS:
         self.add_process("mserver", "mserver: termux session")
         self.add_process("mserver-agent", "mserver-agent: ai core")
         self._log_boot()
+        self.users.ensure_seeded()
         started = self.start_enabled_services()
         for name in started:
             self.syslog.service(name, "started at boot")
@@ -212,6 +218,7 @@ class VOS:
             except KeyError as e:
                 raise VOSFsError(f"not a directory: {p}") from e
         d = self.vpath(p)
+        self.users.check(p, "r", "ls")
         if not d.is_dir():
             raise VOSFsError(f"not a directory: {p}")
         out = []
@@ -250,11 +257,13 @@ class VOS:
             raise VOSFsError(f"is a directory: {p}")
         if not f.exists():
             raise VOSFsError(f"no such file: {p}")
+        self.users.check(p, "r", "cat")
         return f.read_text(encoding="utf-8", errors="replace")
 
     def write(self, p, content: str, create_dirs: bool = True) -> int:
         self._refuse_procfs_write(p)
         f = self.vpath(p)
+        self.users.check(p, "w", "write")
         if create_dirs:
             f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(content, encoding="utf-8")
@@ -263,16 +272,19 @@ class VOS:
     def append(self, p, text: str) -> None:
         self._refuse_procfs_write(p)
         f = self.vpath(p)
+        self.users.check(p, "w", "append")
         f.parent.mkdir(parents=True, exist_ok=True)
         with f.open("a", encoding="utf-8") as fh:
             fh.write(text)
 
     def mkdir(self, p) -> None:
         self._refuse_procfs_write(p)
+        self.users.check(p, "w", "mkdir")
         self.vpath(p).mkdir(parents=True, exist_ok=True)
 
     def touch(self, p) -> None:
         self._refuse_procfs_write(p)
+        self.users.check(p, "w", "touch")
         f = self.vpath(p)
         f.parent.mkdir(parents=True, exist_ok=True)
         f.touch()
@@ -282,14 +294,19 @@ class VOS:
         f = self.vpath(p)
         if not f.exists():
             raise VOSFsError(f"no such path: {p}")
+        # Removing an entry is a write to its *parent* directory.
+        self.users.check(p, "w", "rm")
         if f.is_dir():
             shutil.rmtree(f)
         else:
             f.unlink()
+        self.users.forget(p)
 
     def copy(self, src, dst) -> None:
         self._refuse_procfs_write(dst)
         s, d = self.vpath(src), self.vpath(dst)
+        self.users.check(src, "r", "cp")
+        self.users.check(dst, "w", "cp")
         if d.is_dir():
             d = d / s.name
         d.parent.mkdir(parents=True, exist_ok=True)
@@ -302,6 +319,8 @@ class VOS:
         self._refuse_procfs_write(src)
         self._refuse_procfs_write(dst)
         s, d = self.vpath(src), self.vpath(dst)
+        self.users.check(src, "w", "mv")
+        self.users.check(dst, "w", "mv")
         if d.is_dir():
             d = d / s.name
         d.parent.mkdir(parents=True, exist_ok=True)

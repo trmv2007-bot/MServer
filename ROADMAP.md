@@ -175,10 +175,16 @@ for the commands that have real flags.
   time** — an unattended job can never reach the confirmation gate, so
   allowing it would have made the scheduler a bypass for every `rm`
   protection.
-- Users, groups, permissions: `useradd`, `su`, `sudo`, `chmod`/`chown` with
-  mode bits enforced in `vpath()`. Enables running the agent as non-root,
-  which is a real safety story rather than a gimmick. Deepest rabbit hole —
-  touches every path in the codebase.
+- ~~Users, groups, permissions~~ — ✅ done (`vos/users.py`). `useradd`,
+  `userdel`, `su`, `logout`, `sudo`, `chmod` (octal + symbolic), `chown`,
+  `id`, `users`; `ls -l` shows real modes/owners; `--as-user agent` runs the
+  whole agent non-root. Enforced in the kernel's mutating ops, **after** the
+  sandbox check, never instead of it — a mode-bit bug must not become a host
+  escape. Ownership/mode live in `/var/lib/vos/permissions.json` inside the
+  rootfs, so snapshots cover them; they are metadata rather than host modes
+  because the rootfs is in the user's home and Android sdcard mounts barely
+  have modes. Watch out: the permission layer must read its own metadata
+  through `_raw_read()`, or `check()` recurses forever.
 - Signals (`kill -9` vs `-15`), per-process environment, disk quotas so `df`
   can actually fill, mount points.
 
@@ -248,9 +254,14 @@ artifact rendering as HTML, mobile layout pass.
 6. ~~**`pkg_create` + agent-driven downloads**~~ — done, 47 new tests.
 7. ~~**Virtual network**~~ — done, 69 new tests.
 8. ~~**`cron`/`at`**~~ — done, 85 new tests.
-9. Next: users + permissions (`useradd`, `su`, `chmod` enforced in `vpath()`)
-   — the deepest remaining rabbit hole, but it is what lets the agent run as
-   non-root. Then dashboard SSE + web terminal.
+9. ~~**Users + permissions**~~ — done, 83 new tests.
+10. Next: dashboard SSE + web terminal (the dashboard is still read-only and
+    static), then signals/quotas, then the Tier 3 curses TUI.
+
+Open follow-ups from users: no passwords, so `su` to a *lower* privilege is
+free and `sudo` is a deliberate-intent marker rather than authentication; no
+supplementary group membership (each user is in exactly one group); the
+setuid/sticky bits parse but are not honoured.
 
 Open follow-ups from the scheduler: no `MAILTO`-style delivery of job output
 back to the agent, so it must read `/var/log/cron.log` itself; no per-job

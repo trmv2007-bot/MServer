@@ -27,6 +27,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--local", action="store_true", help="force offline mode (ignore API key)")
     ap.add_argument("--web", action="store_true", help="start the web dashboard alongside the REPL")
     ap.add_argument("--web-only", action="store_true", help="only run the dashboard (no REPL)")
+    ap.add_argument("--as-user", metavar="NAME", default=None,
+                    help="run the agent as a non-root vOS user (e.g. --as-user "
+                         "agent), so it cannot write to /etc even if it tries")
     ap.add_argument("--net", action="store_true",
                     help="allow the agent to download from the public internet "
                          "(off by default; fetched pages are untrusted input)")
@@ -57,6 +60,15 @@ def main(argv=None) -> int:
 
     if args.net:
         os.environ["MSERVER_NET"] = "1"
+    if args.as_user:
+        try:
+            vos.users.su(args.as_user)
+            ui.println(ui.dim(
+                f"  running as '{args.as_user}' — permissions are enforced; "
+                f"use sudo for root-only work"))
+        except Exception as e:
+            ui.println(ui.dim(f"  --as-user failed: {e}"))
+            return 1
     gate_mode = "allow" if args.yolo else ("deny" if args.safe else "ask")
     agent = Agent(vos, shell, ui, artifacts_dir, force_local=args.local,
                   gate_mode=gate_mode,

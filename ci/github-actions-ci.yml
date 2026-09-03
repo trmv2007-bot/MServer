@@ -42,6 +42,7 @@ jobs:
           python tests/test_userpkg.py
           python tests/test_network.py
           python tests/test_scheduler.py
+          python tests/test_users.py
 
       - name: Smoke test the REPL
         run: |
