@@ -162,6 +162,19 @@ to become, so it runs as root. A reboot restores the skeleton and re-seeds
 the accounts. A non-root user cannot reach this state: deleting
 `/etc/passwd` or `/etc` is itself refused.
 
+**Your API key is stored outside the sandbox, on purpose.** A key saved from
+the settings page or `/key` is written to `~/.mserver/config.json` — the data
+directory, *not* the vOS rootfs — via `os.open(..., 0o600)`, so the file is
+never world-readable even momentarily. The placement is a security boundary,
+not filing preference: the agent has full read access to its own filesystem,
+so a key inside the rootfs could be `cat`-ed by the agent, quoted back in a
+reply, or written somewhere else by a prompt-injected tool call. `vpath()`
+makes the real path unreachable from inside the vOS. The API is
+write-and-mask: reading settings back returns `sk-t••••••3456`, and the audit
+log records which *fields* changed, never their values. Saving a key over
+plain `http://` to a remote host is refused outright; `http://localhost` is
+allowed, for Ollama and llama.cpp.
+
 **Your API key goes to whatever endpoint you configure.** Conversation
 content — including file contents the agent reads — is sent to that provider.
 

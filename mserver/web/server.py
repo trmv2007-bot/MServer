@@ -18,6 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from ..agent import settings as settingsmod
 from ..vos import packages as pkgmod
 from ..vos.kernel import OS_NAME, OS_VERSION, SHELL_VERSION
 from . import events as events_mod
@@ -109,6 +110,7 @@ PAGE = """<!doctype html>
   <table>
    <tr><td class="big"><a href="/chat">talk to the agent →</a></td></tr>
    <tr><td class="big"><a href="/term">open the web terminal →</a></td></tr>
+   <tr><td class="big"><a href="/settings">settings — API key, model →</a></td></tr>
    <tr><th>Session</th><td class="dim">chat and terminal are token-gated (token is printed in the terminal)</td></tr>
    <tr><th>Live</th><td class="dim"><span id="live">connecting…</span></td></tr>
   </table>
@@ -325,19 +327,168 @@ inp.focus();
 </script></body></html>"""
 
 
+SETTINGS_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MServerOS — settings</title>
+<style>
+ :root{color-scheme:dark}
+ *{box-sizing:border-box}
+ body{margin:0;background:#0b0f14;color:#c9d1d9;
+      font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;padding:0 0 40px}
+ header{padding:12px 16px;border-bottom:1px solid #1d2530;display:flex;
+        gap:12px;align-items:center;flex-wrap:wrap}
+ h1{font-size:15px;margin:0;color:#7ee787}
+ .wrap{max-width:640px;margin:0 auto;padding:20px 16px}
+ .card{background:#11161d;border:1px solid #21262d;border-radius:10px;
+       padding:18px;margin-bottom:16px}
+ h2{font-size:12px;color:#58a6ff;margin:0 0 14px;text-transform:uppercase;
+    letter-spacing:.08em}
+ label{display:block;margin:14px 0 5px;font-size:13px}
+ .hint{color:#6b7684;font-size:12px;margin:3px 0 0}
+ input,select{width:100%;background:#0d1117;border:1px solid #21262d;
+       border-radius:6px;color:#c9d1d9;padding:9px 11px;font:inherit}
+ input:focus,select:focus{outline:0;border-color:#58a6ff}
+ input:disabled{opacity:.5}
+ .row{display:flex;gap:12px}.row>div{flex:1}
+ button{background:#238636;border:0;border-radius:6px;color:#fff;
+        padding:10px 18px;font:inherit;cursor:pointer;margin-top:18px}
+ button.sec{background:#21262d;margin-left:8px}
+ .ok{color:#7ee787}.err{color:#ff7b72}.dim{color:#6b7684}.warn{color:#d29922}
+ #msg{margin-top:14px;min-height:22px}
+ a{color:#58a6ff}
+ code{background:#0d1117;padding:1px 5px;border-radius:4px;font-size:12px}
+ .pill{border:1px solid #1d2530;border-radius:99px;padding:1px 9px;font-size:12px}
+</style></head><body>
+<header>
+  <h1>settings</h1>
+  <span class="pill dim" id="state">__MODE__</span>
+  <span class="dim" style="margin-left:auto">
+    <a href="/">status</a> · <a href="/chat">chat</a> · <a href="/term">terminal</a>
+  </span>
+</header>
+<div class="wrap">
+<div class="card">
+  <h2>LLM connection</h2>
+  <div id="envwarn"></div>
+
+  <label for="key">API key</label>
+  <input id="key" type="password" autocomplete="off" spellcheck="false"
+         placeholder="sk-...">
+  <p class="hint" id="keyhint">Stored in <code>~/.mserver/config.json</code>
+     (chmod 600), outside the vOS so the agent cannot read it.</p>
+
+  <label for="url">Endpoint</label>
+  <input id="url" spellcheck="false" placeholder="https://api.openai.com/v1">
+  <p class="hint">Any OpenAI-compatible API — OpenAI, Groq, Together,
+     OpenRouter, or a local Ollama/llama.cpp server.</p>
+
+  <label for="model">Model</label>
+  <input id="model" spellcheck="false" placeholder="gpt-4o-mini">
+
+  <div class="row">
+    <div>
+      <label for="timeout">Timeout (s)</label>
+      <input id="timeout" type="number" min="1" max="3600" placeholder="180">
+      <p class="hint">Raise on slow mobile data.</p>
+    </div>
+    <div>
+      <label for="retries">Retries</label>
+      <input id="retries" type="number" min="0" max="10" placeholder="3">
+      <p class="hint">On 429 / 5xx / network errors.</p>
+    </div>
+  </div>
+
+  <button id="save">Save &amp; apply</button>
+  <button id="test" class="sec" type="button">Test connection</button>
+  <button id="clear" class="sec" type="button">Clear key</button>
+  <div id="msg"></div>
+</div>
+<p class="dim" style="font-size:12px">
+  Environment variables always win over anything saved here, so an existing
+  <code>export MOPENAI_API_KEY=…</code> keeps working. Saving takes effect
+  immediately — no restart.
+</p>
+</div>
+<script>
+const token=new URLSearchParams(location.search).get('token')||'';
+const $=id=>document.getElementById(id);
+const msg=$('msg');
+function say(t,cls){msg.innerHTML='<span class="'+(cls||'dim')+'">'+t+'</span>';}
+async function api(action,body){
+  const r=await fetch('/api/settings',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(Object.assign({token,action},body||{}))});
+  return r.json();
+}
+async function load(){
+  try{
+    const r=await fetch('/api/settings?token='+encodeURIComponent(token));
+    const j=await r.json();
+    if(!j.ok){say(j.error||'unauthorised','err');return;}
+    $('key').placeholder=j.masked||'sk-...';
+    $('url').value=j.base_url||''; $('model').value=j.model||'';
+    $('timeout').value=j.timeout||''; $('retries').value=j.retries||'';
+    $('state').textContent=j.online?('AI · '+j.model):'offline · no key';
+    $('state').className='pill '+(j.online?'ok':'warn');
+    if(j.env && Object.keys(j.env).length){
+      const names=Object.keys(j.env).map(k=>k+' ('+j.env[k]+')').join(', ');
+      $('envwarn').innerHTML='<p class="hint warn">Set by environment and '+
+        'not editable here: '+names+'</p>';
+      for(const k of Object.keys(j.env)){
+        const el=$({api_key:'key',base_url:'url',model:'model',
+                    timeout:'timeout',retries:'retries'}[k]);
+        if(el) el.disabled=true;
+      }
+    }
+  }catch(e){say('could not load settings','err');}
+}
+$('save').onclick=async()=>{
+  say('saving…');
+  const p={};
+  if($('key').value) p.api_key=$('key').value;
+  if(!$('url').disabled) p.base_url=$('url').value;
+  if(!$('model').disabled) p.model=$('model').value;
+  if(!$('timeout').disabled) p.timeout=$('timeout').value;
+  if(!$('retries').disabled) p.retries=$('retries').value;
+  const j=await api('save',p);
+  if(!j.ok){say(j.error||'failed','err');return;}
+  $('key').value='';
+  say(j.online?'Saved. Agent is online with '+j.model
+              :'Saved, but there is still no API key — agent stays offline.',
+      j.online?'ok':'warn');
+  load();
+};
+$('test').onclick=async()=>{
+  say('testing…');
+  const j=await api('test',{});
+  say(j.ok?('Connected — '+(j.detail||'ok')):('Failed: '+(j.error||'?')),
+      j.ok?'ok':'err');
+};
+$('clear').onclick=async()=>{
+  if(!confirm('Remove the stored API key?')) return;
+  const j=await api('clear',{});
+  say(j.ok?'Key removed — agent is offline.':'Failed','warn');
+  load();
+};
+load();
+</script></body></html>"""
+
+
 def _rows(pairs):
     return "".join(f"<tr><th>{html.escape(k)}</th><td>{v}</td></tr>" for k, v in pairs)
 
 
 class Dashboard:
     def __init__(self, vos, shell, artifacts_dir, port: int = 8686, host: str = "0.0.0.0",
-                 agent=None, token: str | None = None):
+                 agent=None, token: str | None = None, data_dir=None):
         self.vos = vos
         self.shell = shell
         self.artifacts_dir = artifacts_dir
         self.port = port
         self.host = host
         self.agent = agent
+        self.data_dir = data_dir
         self.token = token or secrets.token_urlsafe(8)
         self.limiter = RateLimiter()
         # A separate, roomier budget for the terminal: typing 20 commands in
@@ -424,6 +575,15 @@ class Dashboard:
                     self._sse()
                 elif route == "/api/status":
                     self._json(200, dash.status())
+                elif route == "/settings":
+                    page = SETTINGS_PAGE.replace("__MODE__",
+                                                 html.escape(dash.mode_label))
+                    self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
+                elif route == "/api/settings":
+                    if not self._authed():
+                        self._json(401, {"ok": False, "error": "bad or missing token"})
+                    else:
+                        self._json(200, dash.settings_state())
                 elif route == "/term":
                     page = TERM_PAGE.replace("__MODE__", html.escape(dash.mode_label))
                     self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
@@ -440,6 +600,42 @@ class Dashboard:
                         self._send(404, "text/plain", b"not found")
                 else:
                     self._send(404, "text/plain", b"not found")
+
+            def _do_settings(self):
+                """Read or change LLM settings from the dashboard."""
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                except (ValueError, OSError):
+                    self._json(400, {"ok": False, "error": "bad JSON body"})
+                    return
+                client = self.client_address[0] if self.client_address else "?"
+                allowed, retry_in = dash.limiter.check(client)
+                if not allowed:
+                    self._json(429, {"ok": False,
+                                     "error": f"too many requests — wait {retry_in}s"})
+                    return
+                if not isinstance(body, dict) or not hmac.compare_digest(
+                        str(body.get("token", "")), dash.token):
+                    dash.limiter.fail(client)
+                    dash.log_auth(f"failed settings auth from {client}")
+                    self._json(401, {"ok": False, "error": "bad token"})
+                    return
+                action = str(body.get("action") or "save")
+                try:
+                    if action == "save":
+                        self._json(200, dash.save_settings(body, client))
+                    elif action == "clear":
+                        self._json(200, dash.clear_settings(client))
+                    elif action == "test":
+                        self._json(200, dash.test_connection())
+                    else:
+                        self._json(400, {"ok": False,
+                                         "error": f"unknown action {action!r}"})
+                except settingsmod.SettingsError as e:
+                    self._json(400, {"ok": False, "error": str(e)})
+                except Exception as e:
+                    self._json(500, {"ok": False, "error": f"settings error: {e}"})
 
             def _do_term(self):
                 """Run one shell command typed into the web terminal.
@@ -484,6 +680,9 @@ class Dashboard:
                 route = self.path.split("?")[0]
                 if route == "/term":
                     self._do_term()
+                    return
+                if route == "/api/settings":
+                    self._do_settings()
                     return
                 if route != "/chat":
                     self._send(404, "text/plain", b"not found")
@@ -589,6 +788,74 @@ class Dashboard:
         except Exception:
             pass
         return out, err, code
+
+    # -------------------------------------------------------------- settings
+    def _cfg(self):
+        return getattr(self.agent, "cfg", None)
+
+    def settings_state(self) -> dict:
+        """Current LLM config for the settings page. Never returns the key."""
+        cfg = self._cfg()
+        if cfg is None:
+            return {"ok": False, "error": "agent not attached"}
+        return {
+            "ok": True,
+            "masked": settingsmod.mask(cfg.api_key) or "not set",
+            "has_key": bool(cfg.api_key),
+            "base_url": cfg.base_url,
+            "model": cfg.model,
+            "timeout": cfg.timeout,
+            "retries": cfg.retries,
+            "online": not getattr(self.agent, "local", True),
+            "env": settingsmod.env_overrides(),
+        }
+
+    def save_settings(self, body: dict, client: str = "web") -> dict:
+        if self.data_dir is None:
+            return {"ok": False, "error": "no data directory configured"}
+        payload = {k: body[k] for k in settingsmod.FIELDS if k in body}
+        values = settingsmod.validate(payload)
+        if not values:
+            return {"ok": False, "error": "nothing to change"}
+        settingsmod.save(self.data_dir, values)
+        online = self.agent.reload_config() if self.agent else False
+        changed = ", ".join(sorted(values))
+        # Never log the value itself.
+        self.log_auth(f"settings changed from {client}: {changed}")
+        self.mode_label = (f"AI · {self._cfg().model}" if online
+                           else "offline · local mode")
+        return {"ok": True, "online": online, "model": self._cfg().model,
+                "changed": sorted(values)}
+
+    def clear_settings(self, client: str = "web") -> dict:
+        if self.data_dir is None:
+            return {"ok": False, "error": "no data directory configured"}
+        settingsmod.save(self.data_dir, {"api_key": None})
+        online = self.agent.reload_config() if self.agent else False
+        self.log_auth(f"stored API key cleared from {client}")
+        self.mode_label = (f"AI · {self._cfg().model}" if online
+                           else "offline · local mode")
+        return {"ok": True, "online": online}
+
+    def test_connection(self) -> dict:
+        """Make one tiny real call so 'it works' means it actually works."""
+        cfg = self._cfg()
+        if cfg is None or not cfg.api_key:
+            return {"ok": False, "error": "no API key set"}
+        from ..agent import llm
+        probe = llm.Config(api_key=cfg.api_key, base_url=cfg.base_url,
+                           model=cfg.model, timeout=min(cfg.timeout, 30),
+                           retries=0)
+        try:
+            r = llm.chat([{"role": "user", "content": "reply with: ok"}],
+                         None, probe)
+        except llm.LLMError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return {"ok": True,
+                "detail": f"{cfg.model} replied: "
+                          f"{(r.get('content') or '').strip()[:60]}"}
 
     def log_auth(self, message: str) -> None:
         """Record an authentication event in the vOS auth log."""

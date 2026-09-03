@@ -62,13 +62,44 @@ class Config:
     retries: int = DEFAULT_RETRIES
 
     @classmethod
-    def from_env(cls) -> Config:
+    def from_env(cls, data_dir=None) -> Config:
+        """Build config from stored settings, overridden by the environment.
+
+        Precedence is environment > stored file > default, so exporting
+        MOPENAI_API_KEY keeps working exactly as before and a stored file
+        cannot silently reconfigure a deployment that sets its own vars.
+        """
+        stored = {}
+        if data_dir is not None:
+            try:
+                from . import settings
+                stored = settings.load(data_dir)
+            except Exception:
+                stored = {}
+
+        def pick(field, env_names, default, cast=None):
+            for n in env_names:
+                raw = os.environ.get(n)
+                if raw:
+                    if cast is None:
+                        return raw
+                    try:
+                        return cast(raw)
+                    except (TypeError, ValueError):
+                        return default
+            if field in stored and stored[field] not in (None, ""):
+                try:
+                    return cast(stored[field]) if cast else stored[field]
+                except (TypeError, ValueError):
+                    return default
+            return default
+
         return cls(
-            api_key=os.environ.get("MOPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or "",
-            base_url=os.environ.get("MOPENAI_BASE_URL") or DEFAULT_BASE_URL,
-            model=os.environ.get("MOPENAI_MODEL") or DEFAULT_MODEL,
-            timeout=_env_num("MOPENAI_TIMEOUT", DEFAULT_TIMEOUT, float),
-            retries=_env_num("MOPENAI_RETRIES", DEFAULT_RETRIES, int),
+            api_key=pick("api_key", ("MOPENAI_API_KEY", "OPENAI_API_KEY"), ""),
+            base_url=pick("base_url", ("MOPENAI_BASE_URL",), DEFAULT_BASE_URL),
+            model=pick("model", ("MOPENAI_MODEL",), DEFAULT_MODEL),
+            timeout=pick("timeout", ("MOPENAI_TIMEOUT",), DEFAULT_TIMEOUT, float),
+            retries=pick("retries", ("MOPENAI_RETRIES",), DEFAULT_RETRIES, int),
         )
 
     @property

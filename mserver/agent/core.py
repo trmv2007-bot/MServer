@@ -41,12 +41,14 @@ def _env_int(name: str, default: int) -> int:
 
 class Agent:
     def __init__(self, vos, shell, ui: UI, artifacts_dir, force_local: bool = False,
-                 gate_mode: str = "ask", confirm=None):
+                 gate_mode: str = "ask", confirm=None, data_dir=None):
         self.vos = vos
         self.shell = shell
         self.ui = ui
         self.artifacts_dir = artifacts_dir
-        self.cfg = llm.Config.from_env()
+        self.data_dir = data_dir
+        self.force_local = force_local
+        self.cfg = llm.Config.from_env(data_dir)
         self.local = force_local or not self.cfg.has_key
         self._dashboard = None
         self.audit = AuditLog(vos)
@@ -75,6 +77,19 @@ class Agent:
             f"session start · {'offline' if self.local else self.cfg.model}")
 
     # -------------------------------------------------------------- wiring
+    def reload_config(self) -> bool:
+        """Re-read settings after they change. Returns True if now online.
+
+        Lets the dashboard settings page take effect without a restart —
+        the whole point of having a settings page.
+        """
+        with self._lock:
+            self.cfg = llm.Config.from_env(self.data_dir)
+            self.local = self.force_local or not self.cfg.has_key
+            self.audit.note(
+                f"config reloaded · {'offline' if self.local else self.cfg.model}")
+            return not self.local
+
     def set_dashboard(self, dash) -> None:
         self._dashboard = dash
 

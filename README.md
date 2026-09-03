@@ -69,8 +69,24 @@ mserver ❯ !ls -la /etc
 
 ### AI mode (full agent)
 
-Set an API key before starting — works with **any OpenAI-compatible endpoint**
-(OpenAI, OpenRouter, Groq, LM Studio, Ollama, …):
+Works with **any OpenAI-compatible endpoint** (OpenAI, OpenRouter, Groq,
+LM Studio, Ollama, …). There are three ways to set the key — pick one:
+
+**1. The dashboard (easiest).** Start MServer, open the dashboard, click
+**Settings** in the header — or go straight to `/settings`. Paste the key,
+press *Save & apply*, and the agent switches from offline to AI mode
+**without a restart**. *Test connection* makes one real call to prove the key
+and endpoint actually work. The key is stored in `~/.mserver/config.json`
+with mode `0600`, is never shown again in full (only `sk-t••••••3456`), and
+lives outside the vOS rootfs so the agent itself cannot read it.
+
+**2. The REPL.** `/key sk-...` sets it, `/key` reports the masked value,
+`/key clear` removes it.
+
+**3. Environment variables**, for CI and scripted deployments. Env always
+wins over the stored file, so a config file can never silently reconfigure a
+runner. Fields pinned by the environment show up greyed out in the settings
+page.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
