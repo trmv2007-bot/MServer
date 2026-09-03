@@ -12,6 +12,7 @@ import shutil
 import time
 from pathlib import Path
 
+from .network import Network
 from .procfs import ProcFS
 from .syslog import BOOT_SEQUENCE, SysLog
 
@@ -63,6 +64,7 @@ class VOS:
         self.services: dict[str, dict] = {}
         self.procfs = ProcFS(self)
         self.syslog = SysLog(self, hostname)
+        self.network = Network(self)
         self._boot()
 
     # ------------------------------------------------------------- booting

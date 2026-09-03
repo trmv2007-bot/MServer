@@ -163,6 +163,7 @@ MServer/
 │   │   ├── procfs.py      # synthetic /proc, generated on read
 │   │   ├── syslog.py      # /var/log + dmesg ring buffer
 │   │   ├── userpkg.py     # packages the agent writes for itself
+│   │   ├── network.py     # virtual network: DNS, ports, nginx serving
 │   │   ├── shell.py       # msh interpreter
 │   │   ├── snapshots.py   # filesystem snapshots / rollback
 │   │   └── packages.py    # pkg registry (cowsay, nginx, git, …)
@@ -377,6 +378,58 @@ Treat that banner as a speed bump, not a guarantee. The real boundary is the
 sandbox: even a fully prompt-injected model can still only touch the virtual
 filesystem, and still has to ask before destroying anything.
 
+
+## The virtual network
+
+nginx used to "run" without serving anything — the config file existed and
+nothing read it. Now it does.
+
+```
+mserver ❯ pkg install nginx && service nginx start
+  nginx started (pid 13)
+
+mserver ❯ netstat -tln
+  Proto Recv-Q Send-Q Local Address    Foreign Address   State    PID/Program name
+  tcp        0      0 0.0.0.0:80       0.0.0.0:*         LISTEN   13/nginx
+
+mserver ❯ curl http://mserver/
+  <h1>Hello from nginx on MServerOS</h1>
+
+mserver ❯ curl -I http://mserver/ | grep HTTP
+  HTTP/1.1 200 OK
+```
+
+`/etc/nginx/nginx.conf` genuinely drives behaviour: change `listen 80` to
+`listen 8080` and port 80 starts refusing connections; change `root /srv/www`
+and it serves from somewhere else. Edit `/etc/hosts` and new names resolve.
+Requests are written to `/var/log/nginx.log` in access-log format.
+
+| Command | What it does |
+|---|---|
+| `ping [-c n] <host>` | resolve and ping; loopback is fast, remote hosts slower |
+| `ifconfig [iface]` / `ip addr` / `ip route` | interfaces and routing |
+| `netstat -tln` | listening ports, derived from what is actually running |
+| `curl [-i\|-I] <url>` | fetch from the vOS's own web server |
+| `wget [-O file] <url>` | download into the virtual filesystem |
+| `host` / `nslookup` | query the virtual resolver |
+
+Topology mimics QEMU user-mode networking: `lo` at `127.0.0.1`, `eth0` at
+`10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3`.
+
+### It deliberately cannot reach the real internet
+
+```
+mserver ❯ curl http://example.com/
+  curl: (7) Failed to connect to example.com port 80: Network is unreachable
+        (the vOS network is virtual; only hosts inside it are reachable)
+```
+
+No socket is ever opened on the host. The agent's one path to the real
+internet is `web_fetch` (opt-in, `--net`), which is guarded and labels its
+output as untrusted. If `curl` could also reach outside there would be two
+egress paths with two different rule sets, and the weaker one would decide
+the security of the system.
+
 ## Audit log
 
 Every tool call is appended to `/var/log/agent.log` **inside the vOS**, so you
@@ -421,6 +474,7 @@ python3 tests/test_safety.py
 python3 tests/test_shell2.py
 python3 tests/test_procfs.py
 python3 tests/test_userpkg.py
+python3 tests/test_network.py
 ```
 
 Or all at once, if you have pytest:

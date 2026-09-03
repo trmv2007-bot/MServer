@@ -183,6 +183,30 @@ def build_tools(vos, shell, hooks):
         except Exception as e:
             return f"error: fetch failed: {e}"
 
+    def t_net(a):
+        """Inspect the virtual network, or fetch from it."""
+        action = (a.get("action") or "status").strip().lower()
+        if action == "status":
+            o1, _, _ = shell.run("ifconfig")
+            o2, _, _ = shell.run("netstat -tln")
+            return f"{o1}\n\n{o2}"
+        if action == "listeners":
+            out, err, _ = shell.run("netstat -tln")
+            return out or err
+        if action == "ping":
+            host = (a.get("target") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9._:-]+", host or ""):
+                return "error: bad host"
+            out, err, code = shell.run(f"ping -c 3 {host}")
+            return fmt_shell(f"ping -c 3 {host}", out, err, code)
+        if action in ("curl", "fetch", "get"):
+            url = (a.get("target") or "").strip()
+            if not url or " " in url:
+                return "error: target must be a URL"
+            out, err, code = shell.run(f"curl -i {url}")
+            return fmt_shell(f"curl -i {url}", _clip(out), err, code)
+        return "error: action must be status | listeners | ping | curl"
+
     def t_services(a):
         out, err, _ = shell.run("ps")
         return out or err
@@ -388,6 +412,18 @@ def build_tools(vos, shell, hooks):
         ),
         _schema("services", "Show running processes/services in the vOS.", {}, []),
         _schema(
+            "net",
+            "Inspect or use the vOS's virtual network. 'status' shows "
+            "interfaces and listening ports, 'listeners' shows open ports, "
+            "'ping' checks a host, 'curl' fetches a URL served from inside "
+            "the vOS (e.g. http://mserver/ when nginx is running). This is "
+            "the VIRTUAL network only — it cannot reach the real internet; "
+            "use web_fetch for that.",
+            {"action": S("status | listeners | ping | curl"),
+             "target": S("hostname for ping, or URL for curl")},
+            ["action"],
+        ),
+        _schema(
             "present",
             "Present a finished artifact (report, config, table, ASCII art) to the "
             "user in a highlighted panel. Call it exactly once when the task is done.",
@@ -418,6 +454,7 @@ def build_tools(vos, shell, hooks):
         "pkg_created": t_pkg_created,
         "web_fetch": t_web_fetch,
         "services": t_services,
+        "net": t_net,
         "present": t_present,
         "dashboard": t_dashboard,
     }

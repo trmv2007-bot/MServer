@@ -175,9 +175,17 @@ for the commands that have real flags.
   can actually fill, mount points.
 
 ### Networking
-- Virtual hosts in `/etc/hosts` that actually resolve; `ping`, `netstat`, `nc`.
-- Real `ssh` between vOS instances (currently a stub service).
-- nginx genuinely serving `/srv/www` over the virtual network.
+- ~~Virtual hosts in `/etc/hosts` that actually resolve; `ping`, `netstat`~~ —
+  ✅ done (`vos/network.py`). Resolver reads `/etc/hosts` plus a small virtual
+  DNS table; `ping`, `ifconfig`, `ip addr|route`, `netstat`, `host`,
+  `nslookup`, `curl`, `wget`. Listening ports are derived from running
+  services, so `service nginx stop` really does close port 80.
+- ~~nginx genuinely serving `/srv/www`~~ — ✅ done. `/etc/nginx/nginx.conf` is
+  parsed for `listen`/`root`/`index` and actually drives behaviour; 200/403/404
+  are real, path traversal is refused, requests are logged to
+  `/var/log/nginx.log`. The vOS network cannot reach the real internet by
+  design — `web_fetch` stays the single guarded egress path.
+- `nc`, and real `ssh` between vOS instances (currently a stub service).
 - Opt-in *real* internet fetch, clearly gated — note this makes fetched
   content an indirect prompt-injection vector, so it must be treated as data,
   never as instructions.
@@ -230,10 +238,13 @@ artifact rendering as HTML, mobile layout pass.
 4. ~~**Coreutils batch**~~ — done.
 5. ~~**`/proc` + richer logging**~~ — done.
 6. ~~**`pkg_create` + agent-driven downloads**~~ — done, 47 new tests.
-7. Next headline feature: the virtual network (`ping`, real `ssh` between vOS
-   instances, nginx actually serving `/srv/www`). Now more valuable than
-   before, because agent-written packages would have something to talk to.
-8. Then: cron/at, users+permissions, dashboard SSE + web terminal.
+7. ~~**Virtual network**~~ — done, 69 new tests.
+8. Next: `cron`/`at` (a ticking scheduler — the vOS still only ever reacts),
+   then users+permissions, then dashboard SSE + web terminal.
+
+Open follow-ups from the network: `nc` and inter-instance `ssh` are still
+stubs; there are no virtual sockets, so a package cannot listen on a port of
+its own; HTTP is GET-only (no POST, redirects or keep-alive).
 
 Open follow-ups from `pkg_create`: package commands cannot yet call each
 other's helpers or define functions; there is no `pkg export`/`pkg import` for

@@ -11,6 +11,7 @@ import re
 import time
 from datetime import datetime
 
+from . import network as netmod
 from . import packages as pkgmod
 from . import snapshots as snapmod
 from . import userpkg
@@ -170,6 +171,10 @@ class Shell:
             "neofetch": S.cmd_neofetch, "history": S.cmd_history,
             "which": S.cmd_which, "free": S.cmd_free, "df": S.cmd_df,
             "pkg": S.cmd_pkg, "service": S.cmd_service,
+            "ping": S.cmd_ping, "ifconfig": S.cmd_ifconfig,
+            "ip": S.cmd_ip, "netstat": S.cmd_netstat,
+            "curl": S.cmd_curl, "wget": S.cmd_wget,
+            "host": S.cmd_host, "nslookup": S.cmd_nslookup,
             "snapshot": S.cmd_snapshot,
             "export": S.cmd_export, "unset": S.cmd_unset,
             "alias": S.cmd_alias, "unalias": S.cmd_unalias,
@@ -215,6 +220,14 @@ class Shell:
             "df": "disk usage",
             "pkg": "package manager (pkg list|search|info|install|remove)",
             "service": "services (service [name] start|stop|status)",
+            "ping": "ping a host on the virtual network (ping [-c n] host)",
+            "ifconfig": "show network interfaces",
+            "ip": "show addresses or routes (ip addr | ip route)",
+            "netstat": "show listening ports (netstat -tln)",
+            "curl": "fetch a URL from the vOS network (curl [-i|-I] url)",
+            "wget": "download a URL into a file (wget [-O file] url)",
+            "host": "resolve a hostname to an address",
+            "nslookup": "query the virtual DNS resolver",
             "snapshot": "snapshots (snapshot [save|rollback|rm|list] [name])",
             "export": "set an environment variable (export NAME=value)",
             "unset": "remove an environment variable (unset NAME)",
@@ -687,6 +700,169 @@ class Shell:
 
     def cmd_clear(self, args, stdin):
         return "", "", 0
+
+    # ------------------------------------------------------------ network
+    def cmd_ping(self, args, stdin):
+        count = 4
+        rest = []
+        i = 0
+        while i < len(args):
+            if args[i] == "-c" and i + 1 < len(args):
+                try:
+                    count = int(args[i + 1])
+                except ValueError:
+                    return "", "ping: bad count", 1
+                i += 2
+                continue
+            rest.append(args[i])
+            i += 1
+        if not rest:
+            return "", "usage: ping [-c count] <host>", 1
+        out, code = self.vos.network.ping(rest[0], count)
+        return (out, "", 0) if code == 0 else ("", out, code)
+
+    def cmd_ifconfig(self, args, stdin):
+        ifs = self.vos.network.interfaces()
+        want = args[0] if args else None
+        if want and want not in ifs:
+            return "", f"ifconfig: interface {want} does not exist", 1
+        blocks = []
+        for name in ([want] if want else ifs):
+            d = ifs[name]
+            head = f"{name}: flags=4163<{d['flags']}>  mtu {d['mtu']}"
+            body = [f"        inet {d['ip']}  netmask {d['netmask']}"]
+            if d.get("broadcast"):
+                body[-1] += f"  broadcast {d['broadcast']}"
+            if d.get("mac"):
+                body.append(f"        ether {d['mac']}  txqueuelen 1000  (Ethernet)")
+            else:
+                body.append("        loop  txqueuelen 1000  (Local Loopback)")
+            body.append("        RX packets 0  bytes 0 (0.0 B)")
+            body.append("        TX packets 0  bytes 0 (0.0 B)")
+            blocks.append(head + "\n" + "\n".join(body))
+        return "\n\n".join(blocks), "", 0
+
+    def cmd_ip(self, args, stdin):
+        net = self.vos.network
+        sub = args[0] if args else "addr"
+        if sub in ("a", "addr", "address", "link"):
+            ifs = net.interfaces()
+            out = []
+            for i, (name, d) in enumerate(ifs.items(), start=1):
+                out.append(f"{i}: {name}: <{d['flags']}> mtu {d['mtu']}")
+                if d.get("mac"):
+                    out.append(f"    link/ether {d['mac']}")
+                else:
+                    out.append("    link/loopback 00:00:00:00:00:00")
+                if sub != "link":
+                    out.append(f"    inet {d['ip']} scope global {name}")
+            return "\n".join(out), "", 0
+        if sub in ("r", "route"):
+            return (f"default via {netmod.GATEWAY} dev eth0\n"
+                    f"10.0.2.0/24 dev eth0 proto kernel scope link src "
+                    f"{netmod.HOST_IP}"), "", 0
+        return "", f"ip: unknown object {sub!r} (try: addr, link, route)", 1
+
+    def cmd_netstat(self, args, stdin):
+        lis = self.vos.network.listeners()
+        head = ("Active Internet connections (only servers)\n"
+                "Proto Recv-Q Send-Q Local Address           "
+                "Foreign Address         State       PID/Program name")
+        rows = [
+            f"{l['proto']:<6}{0:>6} {0:>6} {l['addr'] + ':' + str(l['port']):<24}"
+            f"{'0.0.0.0:*':<24}{l['state']:<12}{l['pid']}/{l['service']}"
+            for l in lis
+        ]
+        return head + ("\n" + "\n".join(rows) if rows else ""), "", 0
+
+    def cmd_host(self, args, stdin):
+        if not args:
+            return "", "usage: host <name>", 1
+        name = args[0]
+        ip = self.vos.network.resolve(name)
+        if ip is None:
+            return "", f"Host {name} not found: 3(NXDOMAIN)", 1
+        return f"{name} has address {ip}", "", 0
+
+    def cmd_nslookup(self, args, stdin):
+        if not args:
+            return "", "usage: nslookup <name>", 1
+        name = args[0]
+        ip = self.vos.network.resolve(name)
+        head = f"Server:\t\t{netmod.DNS}\nAddress:\t{netmod.DNS}#53\n"
+        if ip is None:
+            return "", head + f"\n** server can't find {name}: NXDOMAIN", 1
+        return head + f"\nName:\t{name}\nAddress: {ip}", "", 0
+
+    def _http(self, url):
+        net = self.vos.network
+        host, port, path = netmod.parse_url(url)
+        return net.http_get(host, port, path), host, port, path
+
+    def cmd_curl(self, args, stdin):
+        show_headers = False
+        head_only = False
+        silent = False
+        url = None
+        for a in args:
+            if a in ("-i", "--include"):
+                show_headers = True
+            elif a in ("-I", "--head"):
+                head_only = True
+            elif a in ("-s", "--silent"):
+                silent = True
+            elif a.startswith("-"):
+                continue
+            else:
+                url = a
+        if not url:
+            return "", "usage: curl [-i|-I|-s] <url>", 2
+        try:
+            resp, host, port, path = self._http(url)
+        except netmod.NetworkError as e:
+            return "", f"curl: (7) {e}", 7
+        hdr = (f"HTTP/1.1 {resp['status']} {resp['reason']}\n" +
+               "\n".join(f"{k}: {v}" for k, v in resp["headers"].items()))
+        self.vos.syslog.service(
+            "nginx", f'"GET {path} HTTP/1.1" {resp["status"]} '
+                     f'{resp["headers"]["Content-Length"]}')
+        if head_only:
+            return hdr, "", 0
+        if show_headers:
+            return hdr + "\n\n" + resp["body"], "", 0
+        if resp["status"] >= 400 and not silent:
+            return resp["body"], "", 22
+        return resp["body"], "", 0
+
+    def cmd_wget(self, args, stdin):
+        url = None
+        outfile = None
+        i = 0
+        while i < len(args):
+            if args[i] in ("-O", "-o") and i + 1 < len(args):
+                outfile = args[i + 1]
+                i += 2
+                continue
+            if not args[i].startswith("-"):
+                url = args[i]
+            i += 1
+        if not url:
+            return "", "usage: wget [-O file] <url>", 1
+        try:
+            resp, host, port, path = self._http(url)
+        except netmod.NetworkError as e:
+            return "", f"wget: unable to resolve or connect: {e}", 4
+        if resp["status"] >= 400:
+            return "", f"wget: server returned error: HTTP/1.1 {resp['status']} {resp['reason']}", 8
+        name = outfile or (path.rstrip("/").rsplit("/", 1)[-1] or "index.html")
+        dest = name if name.startswith("/") else self._join(self.cwd, name)
+        self.vos.write(dest, resp["body"])
+        size = resp["headers"]["Content-Length"]
+        self.vos.syslog.service("nginx", f'"GET {path} HTTP/1.1" {resp["status"]} {size}')
+        return (f"Connecting to {host}:{port}... connected.\n"
+                f"HTTP request sent, awaiting response... {resp['status']} {resp['reason']}\n"
+                f"Length: {size}\nSaving to: '{self.vos.vname(self.vos.vpath(dest))}'\n\n"
+                f"'{name}' saved [{size}]"), "", 0
 
     def cmd_dmesg(self, args, stdin):
         text = self.vos.syslog.dmesg(self.vos.boot_time)
