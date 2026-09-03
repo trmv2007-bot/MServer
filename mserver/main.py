@@ -127,6 +127,7 @@ def main(argv=None) -> int:
     if dash.running:
         dash.stop()
     shell.save_history()
+    vos.scheduler.stop()   # don't leave crond ticking after the REPL exits
     ui.println(ui.dim(f"\n  {OS_NAME} halted. goodbye."))
     return 0
 

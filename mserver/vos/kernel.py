@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .network import Network
 from .procfs import ProcFS
+from .scheduler import Scheduler
 from .syslog import BOOT_SEQUENCE, SysLog
 
 OS_NAME = "MServerOS"
@@ -65,6 +66,7 @@ class VOS:
         self.procfs = ProcFS(self)
         self.syslog = SysLog(self, hostname)
         self.network = Network(self)
+        self.scheduler = Scheduler(self)
         self._boot()
 
     # ------------------------------------------------------------- booting
@@ -149,6 +151,8 @@ class VOS:
                 self.write(f"/var/run/{name}.pid", f"{pid}\n")
             except (VOSPathError, VOSFsError):
                 pass
+            if name == "cron":
+                self.scheduler.start()
             started.append(name)
         return started
 

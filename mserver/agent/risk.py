@@ -78,6 +78,16 @@ _ROOT_WIPE = re.compile(
 )
 
 
+def is_destructive_command(cmd: str) -> bool:
+    """Does this shell command line destroy data?
+
+    Exported so the scheduler can refuse to run destructive work unattended:
+    a cron job fires with nobody watching, so the confirmation gate can never
+    prompt, and scheduling would otherwise be a way around it.
+    """
+    return bool(_DESTRUCTIVE_CMD.search(cmd or ""))
+
+
 def classify(tool: str, args: dict | None = None) -> str:
     """Return the risk tier for a tool call."""
     args = args or {}

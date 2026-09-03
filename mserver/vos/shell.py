@@ -13,6 +13,7 @@ from datetime import datetime
 
 from . import network as netmod
 from . import packages as pkgmod
+from . import scheduler as cronmod
 from . import snapshots as snapmod
 from . import userpkg
 from .kernel import (
@@ -26,6 +27,7 @@ from .kernel import (
 )
 
 SERVICE_DEFS = {
+    "cron": {"binary": "crond", "cmdline": "crond: /usr/sbin/crond -f"},
     "ssh": {"binary": "sshd", "cmdline": "sshd: /usr/sbin/sshd -D"},
     "nginx": {"binary": "nginx", "cmdline": "nginx: master process /usr/sbin/nginx"},
 }
@@ -171,6 +173,7 @@ class Shell:
             "neofetch": S.cmd_neofetch, "history": S.cmd_history,
             "which": S.cmd_which, "free": S.cmd_free, "df": S.cmd_df,
             "pkg": S.cmd_pkg, "service": S.cmd_service,
+            "crontab": S.cmd_crontab, "at": S.cmd_at,
             "ping": S.cmd_ping, "ifconfig": S.cmd_ifconfig,
             "ip": S.cmd_ip, "netstat": S.cmd_netstat,
             "curl": S.cmd_curl, "wget": S.cmd_wget,
@@ -220,6 +223,8 @@ class Shell:
             "df": "disk usage",
             "pkg": "package manager (pkg list|search|info|install|remove)",
             "service": "services (service [name] start|stop|status)",
+            "crontab": "scheduled jobs (crontab -l | -a 'spec' 'cmd' | -r id | -n)",
+            "at": "run a command later (at +5m 'cmd' | at -l | at -r id)",
             "ping": "ping a host on the virtual network (ping [-c n] host)",
             "ifconfig": "show network interfaces",
             "ip": "show addresses or routes (ip addr | ip route)",
@@ -700,6 +705,82 @@ class Shell:
 
     def cmd_clear(self, args, stdin):
         return "", "", 0
+
+    # ---------------------------------------------------------- scheduling
+    def _cron_running(self):
+        return self.vos.service_state("cron") == "running"
+
+    def _cron_hint(self):
+        return "" if self._cron_running() else \
+            "\n(note: crond is not running — start it with: service cron start)"
+
+    def cmd_crontab(self, args, stdin):
+        sched = self.vos.scheduler
+        sub = args[0] if args else "-l"
+        try:
+            if sub in ("-l", "--list", "list"):
+                jobs = sched.list_jobs()
+                if not jobs:
+                    return "(no cron jobs)" + self._cron_hint(), "", 0
+                rows = ["  ID  SCHEDULE          WHEN                  COMMAND"]
+                for j in jobs:
+                    rows.append(
+                        f"  {j['id']:<3} {j['spec']:<17} "
+                        f"{cronmod.describe(j['spec'])[:21]:<21} {j['command']}")
+                return "\n".join(rows) + self._cron_hint(), "", 0
+            if sub in ("-a", "add"):
+                if len(args) < 3:
+                    return "", ("usage: crontab -a '<schedule>' '<command>'\n"
+                                "  e.g. crontab -a '*/5 * * * *' 'logger backup ok'\n"
+                                "       crontab -a @hourly 'df'"), 1
+                job = sched.add_job(args[1], " ".join(args[2:]))
+                return (f"added: {job['spec']} {job['command']}"
+                        f"  ({cronmod.describe(job['spec'])})"
+                        + self._cron_hint()), "", 0
+            if sub in ("-r", "remove", "rm"):
+                if len(args) < 2:
+                    n = sched.clear_jobs()
+                    return f"removed all cron jobs ({n})", "", 0
+                job = sched.remove_job(int(args[1]))
+                return f"removed: {job['spec']} {job['command']}", "", 0
+            if sub in ("-n", "--now", "run"):
+                fired = sched.tick()
+                return (f"ran {fired} due job(s); see /var/log/cron.log"), "", 0
+        except cronmod.CronError as e:
+            return "", f"crontab: {e}", 1
+        except ValueError:
+            return "", "crontab: id must be a number", 1
+        return "", f"crontab: unknown option {sub!r} (try -l, -a, -r, -n)", 1
+
+    def cmd_at(self, args, stdin):
+        sched = self.vos.scheduler
+        if not args or args[0] in ("-l", "--list", "list"):
+            jobs = sched.at_jobs()
+            if not jobs:
+                return "(no queued jobs)" + self._cron_hint(), "", 0
+            rows = ["  ID  WHEN              COMMAND"]
+            for j in jobs:
+                when = time.strftime("%a %d %b %H:%M", time.localtime(j["when"]))
+                rows.append(f"  {j['id']:<3} {when:<17} {j['command']}")
+            return "\n".join(rows) + self._cron_hint(), "", 0
+        try:
+            if args[0] in ("-r", "-d", "remove", "cancel"):
+                if len(args) < 2:
+                    return "", "usage: at -r <id>", 1
+                job = sched.remove_at(int(args[1]))
+                return f"cancelled job {job['id']}: {job['command']}", "", 0
+            if len(args) < 2:
+                return "", ("usage: at <time> <command>\n"
+                            "  e.g. at +5m 'logger woke up'\n"
+                            "       at 17:30 'service nginx stop'"), 1
+            job = sched.add_at(args[0], " ".join(args[1:]))
+            when = time.strftime("%a %d %b %H:%M", time.localtime(job["when"]))
+            return (f"job {job['id']} scheduled for {when}: {job['command']}"
+                    + self._cron_hint()), "", 0
+        except cronmod.CronError as e:
+            return "", f"at: {e}", 1
+        except ValueError:
+            return "", "at: id must be a number", 1
 
     # ------------------------------------------------------------ network
     def cmd_ping(self, args, stdin):
@@ -1431,9 +1512,13 @@ class Shell:
                 "binary": SERVICE_DEFS[name]["binary"],
                 "cmdline": SERVICE_DEFS[name]["cmdline"],
             })
+            if name == "cron":
+                self.vos.scheduler.start()
             self.vos.syslog.service(name, f"started (pid {pid})")
             return f"{name} started (pid {pid})", "", 0
         if action == "stop":
+            if name == "cron":
+                self.vos.scheduler.stop()
             self.vos.set_enabled_service(name, None)
             if self.vos.stop_service(name):
                 try:

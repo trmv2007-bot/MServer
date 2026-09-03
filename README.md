@@ -164,6 +164,7 @@ MServer/
 │   │   ├── syslog.py      # /var/log + dmesg ring buffer
 │   │   ├── userpkg.py     # packages the agent writes for itself
 │   │   ├── network.py     # virtual network: DNS, ports, nginx serving
+│   │   ├── scheduler.py   # cron + at, the vOS's own background thread
 │   │   ├── shell.py       # msh interpreter
 │   │   ├── snapshots.py   # filesystem snapshots / rollback
 │   │   └── packages.py    # pkg registry (cowsay, nginx, git, …)
@@ -430,6 +431,61 @@ output as untrusted. If `curl` could also reach outside there would be two
 egress paths with two different rule sets, and the weaker one would decide
 the security of the system.
 
+
+## Scheduled work: `cron` and `at`
+
+Until now the vOS only ever reacted — something happened because you typed a
+command. `crond` is the first part that acts on its own.
+
+```
+mserver ❯ service cron start
+  cron started (pid 13)
+
+mserver ❯ crontab -a '*/5 * * * *' 'logger backup ok'
+  added: */5 * * * * logger backup ok  (every 5 minutes)
+
+mserver ❯ at +10m 'service nginx stop'
+  job 1 scheduled for Thu 03 Sep 14:22: service nginx stop
+
+mserver ❯ crontab -l
+  ID  SCHEDULE          WHEN                  COMMAND
+  1   */5 * * * *       every 5 minutes       logger backup ok
+```
+
+Standard 5-field syntax with ranges, lists and steps (`*/15`, `1-5`, `0,30`),
+plus `@hourly`/`@daily`/`@weekly`/`@monthly`. Output goes to
+`/var/log/cron.log`, never to your prompt — a background thread printing into
+the REPL would corrupt the line you are typing. `crontab -n` runs everything
+due right now, which is handy for testing a job without waiting.
+
+| Command | What it does |
+|---|---|
+| `crontab -l` | list jobs, with a plain-English gloss of each schedule |
+| `crontab -a '<spec>' '<cmd>'` | add a repeating job |
+| `crontab -r [id]` | remove one job, or all of them |
+| `crontab -n` | run everything that is due right now |
+| `at <time> '<cmd>'` | run once later (`+5m`, `+2h`, `17:30`) |
+| `at -l` / `at -r <id>` | list or cancel queued jobs |
+
+### Destructive commands cannot be scheduled
+
+```
+mserver ❯ crontab -a '* * * * *' 'rm -rf /etc'
+  crontab: refusing to schedule a destructive command. Scheduled jobs run
+  with nobody watching, so the confirmation gate cannot ask you first.
+```
+
+This one matters. Every destructive action in MServer is protected by a
+confirmation prompt — but a cron job fires when nobody is at the keyboard, so
+the gate would have to either block forever or auto-approve. Auto-approving
+would make the scheduler a way around every protection on `rm`. So
+destructive command lines are refused when added **and again before they
+run**; the second check exists because the crontab is an ordinary file that
+something could write to directly.
+
+Jobs also run on their own `Shell` instance with cwd `/root`, so a job that
+does `cd /tmp` cannot move your working directory out from under you.
+
 ## Audit log
 
 Every tool call is appended to `/var/log/agent.log` **inside the vOS**, so you
@@ -475,6 +531,7 @@ python3 tests/test_shell2.py
 python3 tests/test_procfs.py
 python3 tests/test_userpkg.py
 python3 tests/test_network.py
+python3 tests/test_scheduler.py
 ```
 
 Or all at once, if you have pytest:

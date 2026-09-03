@@ -18,6 +18,11 @@ def _clip(text: str) -> str:
     return text[:MAX_OUT] + f"\n... [truncated, {len(text)} chars total]"
 
 
+def _q(s: str) -> str:
+    """Single-quote an argument so it reaches the shell as one word."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
 def fmt_shell(cmd: str, out: str, err: str, code: int) -> str:
     parts = [f"$ {cmd}"]
     if out:
@@ -206,6 +211,36 @@ def build_tools(vos, shell, hooks):
             out, err, code = shell.run(f"curl -i {url}")
             return fmt_shell(f"curl -i {url}", _clip(out), err, code)
         return "error: action must be status | listeners | ping | curl"
+
+    def t_schedule(a):
+        """Inspect or change scheduled work."""
+        action = (a.get("action") or "list").strip().lower()
+        when = (a.get("when") or "").strip()
+        command = (a.get("command") or "").strip()
+        if action == "list":
+            o1, _, _ = shell.run("crontab -l")
+            o2, _, _ = shell.run("at -l")
+            return f"cron jobs:\n{o1}\n\nqueued at jobs:\n{o2}"
+        if action == "cron":
+            if not when or not command:
+                return "error: cron needs 'when' (e.g. '*/5 * * * *') and 'command'"
+            out, err, code = shell.run(f"crontab -a {_q(when)} {_q(command)}")
+            return fmt_shell("crontab -a", out, err, code)
+        if action == "at":
+            if not when or not command:
+                return "error: at needs 'when' (e.g. '+5m') and 'command'"
+            out, err, code = shell.run(f"at {_q(when)} {_q(command)}")
+            return fmt_shell("at", out, err, code)
+        if action == "remove":
+            target = when or command
+            if not target.isdigit():
+                return "error: remove needs the numeric job id in 'when'"
+            out, err, code = shell.run(f"crontab -r {target}")
+            return fmt_shell(f"crontab -r {target}", out, err, code)
+        if action == "log":
+            out, err, _ = shell.run("cat /var/log/cron.log")
+            return _clip(out or err)
+        return "error: action must be list | cron | at | remove | log"
 
     def t_services(a):
         out, err, _ = shell.run("ps")
@@ -412,6 +447,18 @@ def build_tools(vos, shell, hooks):
         ),
         _schema("services", "Show running processes/services in the vOS.", {}, []),
         _schema(
+            "schedule",
+            "Run work later or repeatedly. 'cron' repeats on a schedule "
+            "(when='*/5 * * * *' or '@hourly'), 'at' runs once (when='+5m' or "
+            "'17:30'), 'list' shows both, 'remove' deletes a cron job by id, "
+            "'log' shows what has run. Commands are msh shell commands. The "
+            "crond service must be running: service cron start.",
+            {"action": S("list | cron | at | remove | log"),
+             "when": S("cron schedule, at time, or job id to remove"),
+             "command": S("shell command to run")},
+            ["action"],
+        ),
+        _schema(
             "net",
             "Inspect or use the vOS's virtual network. 'status' shows "
             "interfaces and listening ports, 'listeners' shows open ports, "
@@ -454,6 +501,7 @@ def build_tools(vos, shell, hooks):
         "pkg_created": t_pkg_created,
         "web_fetch": t_web_fetch,
         "services": t_services,
+        "schedule": t_schedule,
         "net": t_net,
         "present": t_present,
         "dashboard": t_dashboard,

@@ -165,8 +165,16 @@ for the commands that have real flags.
 - ~~`/var/log` that fills~~ ✅ done (`vos/syslog.py`): `syslog`, `boot.log`,
   `auth.log`, per-service logs, `dmesg` ring buffer, `logger` command, and a
   boot sequence replayed on every boot. All size-capped.
-- `cron` + `at` — a ticking scheduler thread. The vOS currently only ever
-  reacts; nothing fires on its own.
+- ~~`cron` + `at`~~ — ✅ done (`vos/scheduler.py`). A real background thread
+  behind the `cron` service; 5-field specs with ranges/lists/steps plus
+  `@hourly`-style shorthands; `at` for one-shot jobs; output to
+  `/var/log/cron.log`. Jobs run on their own `Shell` so they cannot move the
+  user's cwd, a failing job cannot kill the daemon, and each job fires at
+  most once per due minute (a phone that suspends must not stampede on
+  wake). **Destructive commands are refused at add time and again at run
+  time** — an unattended job can never reach the confirmation gate, so
+  allowing it would have made the scheduler a bypass for every `rm`
+  protection.
 - Users, groups, permissions: `useradd`, `su`, `sudo`, `chmod`/`chown` with
   mode bits enforced in `vpath()`. Enables running the agent as non-root,
   which is a real safety story rather than a gimmick. Deepest rabbit hole —
@@ -239,8 +247,14 @@ artifact rendering as HTML, mobile layout pass.
 5. ~~**`/proc` + richer logging**~~ — done.
 6. ~~**`pkg_create` + agent-driven downloads**~~ — done, 47 new tests.
 7. ~~**Virtual network**~~ — done, 69 new tests.
-8. Next: `cron`/`at` (a ticking scheduler — the vOS still only ever reacts),
-   then users+permissions, then dashboard SSE + web terminal.
+8. ~~**`cron`/`at`**~~ — done, 85 new tests.
+9. Next: users + permissions (`useradd`, `su`, `chmod` enforced in `vpath()`)
+   — the deepest remaining rabbit hole, but it is what lets the agent run as
+   non-root. Then dashboard SSE + web terminal.
+
+Open follow-ups from the scheduler: no `MAILTO`-style delivery of job output
+back to the agent, so it must read `/var/log/cron.log` itself; no per-job
+enable/disable without deleting; `at` times are local-time only.
 
 Open follow-ups from the network: `nc` and inter-instance `ssh` are still
 stubs; there are no virtual sockets, so a package cannot listen on a port of
